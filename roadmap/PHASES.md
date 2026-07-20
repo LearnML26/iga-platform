@@ -8,10 +8,14 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
 
 ## Phase 1R — Remediation & hardening of what's deployed
 
-- [ ] **1R.1 Key Vault DNS zone group** — Add privateDnsZoneGroups to the KV
+- [x] **1R.1 Key Vault DNS zone group** — Add privateDnsZoneGroups to the KV
   private endpoint in `infra/modules/security.bicep` (copy the data.bicep
   pattern). Deploy; verify `az network private-dns record-set a list -g
   rg-iga-dev-network -z privatelink.vaultcore.azure.net` shows kv-iga-dev.
+  Done: added `kvPeDns` resource; deployed (subscription deployment
+  `iga-dev-1r1-1784519192`, Succeeded); confirmed `kv-iga-dev` A record now
+  Bicep-managed (it existed pre-fix from manual CLI drift — Bicep now matches
+  live state); verify.sh green.
 - [ ] **1R.2 Verify all six DNS zones registered** — every zone in
   rg-iga-dev-network shows ≥2 record sets; create any missing zone groups
   via CLI AND ensure Bicep matches.
