@@ -11,6 +11,7 @@ ok()   { echo "  ✔ $1"; }
 bad()  { echo "  ✘ $1"; FAIL=1; }
 
 NS=iga
+API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv 2>/dev/null)"
 
 echo "== Cluster health =="
 if ! kubectl get ns $NS > /dev/null 2>&1; then
@@ -43,27 +44,94 @@ run_curl() {
   kubectl delete pod "$name" -n $NS --ignore-not-found > /dev/null 2>&1
 }
 
+# Mint a bearer token for API_AUDIENCE using a service's own workload identity
+# (1R.3 — no client secrets: exchanges the pod's projected federated token for
+# an AAD access token carrying that service's already-granted app roles).
+# $1 = k8s ServiceAccount name (must already be workload-identity annotated)
+mint_token() {
+  local SA="$1" POD="vrfy-token-${1}"
+  kubectl delete pod "$POD" -n $NS --ignore-not-found > /dev/null 2>&1
+  cat <<PODYAML | kubectl apply -f - > /dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD
+  namespace: $NS
+  labels: { azure.workload.identity/use: "true" }
+spec:
+  serviceAccountName: $SA
+  restartPolicy: Never
+  containers:
+    - name: az
+      image: mcr.microsoft.com/azure-cli:latest
+      command: ["sleep", "90"]
+PODYAML
+  if ! kubectl wait --for=condition=Ready "pod/$POD" -n $NS --timeout=60s > /dev/null 2>&1; then
+    kubectl delete pod "$POD" -n $NS --ignore-not-found > /dev/null 2>&1
+    return 1
+  fi
+  local TOKEN
+  TOKEN=$(kubectl exec -n $NS "$POD" -- env AUD="$API_AUDIENCE" bash -c '
+    az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" \
+      --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" -o none 2>/dev/null &&
+    az account get-access-token --resource "$AUD" --query accessToken -o tsv 2>/dev/null
+  ')
+  kubectl delete pod "$POD" -n $NS --ignore-not-found > /dev/null 2>&1
+  echo "$TOKEN"
+}
+
 # identity-service: health, create (unique key), dedupe
 KEY="VRFY$(date +%s)"
 OUT=$(run_curl vrfy-health http://identity-service/healthz)
 echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "identity-service /healthz 200" || bad "identity-service health failed: $OUT"
 
-OUT=$(run_curl vrfy-create -X POST http://identity-service/identities \
+# 1R.3: JWT auth is enforced on /identities now — mint a token via
+# identity-service's own workload identity (already granted identities.read;
+# identities.write must also be granted, see roadmap/PHASES.md 1R.3 note).
+IDENTITY_TOKEN=$(mint_token identity-service)
+if [ -z "$IDENTITY_TOKEN" ]; then
+  bad "could not mint an identity-service token — is the identities.read/write app role assignment done? (roadmap/PHASES.md 1R.3)"
+fi
+AUTH_HDR=(-H "Authorization: Bearer $IDENTITY_TOKEN")
+
+OUT=$(run_curl vrfy-noauth -X POST http://identity-service/identities \
+  -H 'Content-Type: application/json' \
+  -d "{\"correlationKey\":\"${KEY}-noauth\",\"displayName\":\"Verify Bot\"}")
+echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "identity create without token 401" || bad "expected 401 without token: $OUT"
+
+OUT=$(run_curl vrfy-create -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
   -H 'Content-Type: application/json' \
   -d "{\"correlationKey\":\"$KEY\",\"displayName\":\"Verify Bot\",\"department\":\"QA\",\"jobTitle\":\"Probe\"}")
 echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "identity create 201 ($KEY)" || bad "identity create failed: $OUT"
 
-OUT=$(run_curl vrfy-dedupe -X POST http://identity-service/identities \
+OUT=$(run_curl vrfy-dedupe -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
   -H 'Content-Type: application/json' \
   -d "{\"correlationKey\":\"$KEY\",\"displayName\":\"Verify Bot\",\"department\":\"QA\",\"jobTitle\":\"Probe\"}")
 echo "$OUT" | grep -q 'HTTP_STATUS:409' && ok "correlation dedupe 409" || bad "dedupe check failed: $OUT"
 
-OUT=$(run_curl vrfy-search "http://identity-service/identities?department=QA")
+OUT=$(run_curl vrfy-search "${AUTH_HDR[@]}" "http://identity-service/identities?department=QA")
 echo "$OUT" | grep -q "$KEY" && ok "identity search returns created record" || bad "search failed: $OUT"
 
 # provisioning-service: health + task acceptance (no connector execution asserted)
 OUT=$(run_curl vrfy-prov-health http://provisioning-service/healthz)
 echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "provisioning-service /healthz 200" || bad "provisioning health failed: $OUT"
+
+# 1R.3: /tasks now requires provisioning.write
+OUT=$(run_curl vrfy-prov-noauth -X POST http://provisioning-service/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"sourceType":"manual","sourceRef":"verify","identityId":"verify","instanceId":"verify","connectorType":"ad","operationType":"grant"}')
+echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "task submit without token 401" || bad "expected 401 without token: $OUT"
+
+PROVISIONING_TOKEN=$(mint_token provisioning-service)
+if [ -z "$PROVISIONING_TOKEN" ]; then
+  bad "could not mint a provisioning-service token — is the provisioning.write app role assignment done? (roadmap/PHASES.md 1R.3)"
+else
+  OUT=$(run_curl vrfy-prov-task -X POST http://provisioning-service/tasks \
+    -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"sourceType":"manual","sourceRef":"verify","identityId":"verify","instanceId":"verify","connectorType":"ad","operationType":"grant"}')
+  echo "$OUT" | grep -q 'HTTP_STATUS:202' && ok "task submit (authenticated) 202" || bad "authenticated task submit failed: $OUT"
+fi
 
 # source-system-service: health, create, dedupe (unique name), mapping, feed run
 SRC_NAME="vrfy-src-$(date +%s)"
@@ -93,6 +161,63 @@ if [ -n "${SRC_ID:-}" ]; then
   echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "feed run create 201" || bad "feed run create failed: $OUT"
 else
   bad "source system id not captured — skipped mapping/feed-run checks"
+fi
+
+# flatfile-connector-service (2.2): health + a full ingest round-trip.
+# Uploads a tiny CSV fixture + .md5 sidecar to raw/ via an ephemeral pod
+# using the connector's own workload identity (same mint pattern as above),
+# then asserts the delta summary and checksum verification note.
+OUT=$(run_curl vrfy-ffc-health http://flatfile-connector-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "flatfile-connector-service /healthz 200" || bad "flatfile-connector-service health failed: $OUT"
+
+FFC_SRC_NAME="vrfy-ffc-src-$(date +%s)"
+OUT=$(run_curl vrfy-ffc-src-create -X POST http://source-system-service/source-systems \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$FFC_SRC_NAME\",\"connectorType\":\"flat-file\",\"description\":\"verify probe\"}")
+FFC_SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+if [ -n "${FFC_SRC_ID:-}" ]; then
+  run_curl vrfy-ffc-mapping -X POST "http://source-system-service/source-systems/${FFC_SRC_ID}/mappings" \
+    -H 'Content-Type: application/json' \
+    -d '{"sourceAttribute":"emp_id","targetAttribute":"correlationKey","isKey":true}' > /dev/null
+
+  FFC_POD="vrfy-ffc-upload"
+  kubectl delete pod "$FFC_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+  cat <<PODYAML | kubectl apply -f - > /dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $FFC_POD
+  namespace: $NS
+  labels: { azure.workload.identity/use: "true" }
+spec:
+  serviceAccountName: flatfile-connector-service
+  restartPolicy: Never
+  containers:
+    - name: az
+      image: mcr.microsoft.com/azure-cli:latest
+      command: ["sleep", "90"]
+PODYAML
+  if kubectl wait --for=condition=Ready "pod/$FFC_POD" -n $NS --timeout=60s > /dev/null 2>&1; then
+    kubectl exec -n $NS "$FFC_POD" -- bash -c '
+      az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" \
+        --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" -o none 2>/dev/null
+      printf "emp_id,name\nV1,Alice\nV2,Bob\n" > /tmp/f.csv
+      md5sum /tmp/f.csv | cut -d" " -f1 | tr -d "\n" > /tmp/f.csv.md5
+      az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/f.csv -n verify/ffc-fixture.csv --overwrite -o none
+      az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/f.csv.md5 -n verify/ffc-fixture.csv.md5 --overwrite -o none
+    ' > /dev/null 2>&1
+  fi
+  kubectl delete pod "$FFC_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+
+  OUT=$(run_curl vrfy-ffc-ingest -X POST http://flatfile-connector-service/ingest \
+    -H 'Content-Type: application/json' \
+    -d "{\"sourceSystemInstanceId\":\"${FFC_SRC_ID}\",\"blobPath\":\"verify/ffc-fixture.csv\",\"triggeredBy\":\"verify\"}")
+  echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"recordsAdded":2' \
+    && ok "flat-file ingest: 2 rows added, checksum verified" \
+    || bad "flat-file ingest failed or unexpected delta: $OUT"
+else
+  bad "flatfile connector: source system id not captured — skipped ingest check"
 fi
 
 echo "== Infra spot checks =="
