@@ -247,3 +247,33 @@ async def get_feed_run(run_id: str, session: AsyncSession = Depends(get_session)
     if run is None:
         raise HTTPException(status_code=404, detail="feed run not found")
     return run
+
+
+# Connectors (e.g. the flat-file connector, 2.2) call this to report the delta
+# summary and terminal status once ingestion completes. Only the fields a
+# connector legitimately owns are patchable — id/sourceSystemInstanceId/
+# startedAt/triggeredBy stay immutable here.
+_FEED_RUN_PATCHABLE = {
+    "status",
+    "completedAt",
+    "recordsProcessed",
+    "recordsAdded",
+    "recordsUpdated",
+    "recordsTerminated",
+    "recordsUnmatched",
+    "recordsQuarantined",
+    "errorSummary",
+}
+
+
+@app.patch("/feed-runs/{run_id}", response_model=FeedRunOut)
+async def update_feed_run(run_id: str, patch: dict, session: AsyncSession = Depends(get_session)):
+    run = await session.get(FeedRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="feed run not found")
+    for k, v in patch.items():
+        if k in _FEED_RUN_PATCHABLE:
+            setattr(run, k, v)
+    await session.commit()
+    await session.refresh(run)
+    return run
