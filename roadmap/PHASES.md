@@ -47,20 +47,43 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   version-level WORM policy to the `audit` container via CLI; document why
   it can't be pure Bicep (follow-up call), or implement via deployment script
   resource if clean.
-  BLOCKED, documented (not implemented): `immutableStorageWithVersioning`
-  is create-time-only — confirmed via a failed deployment (`PropertyIsImmutable`)
-  that it cannot be added to the already-existing `stigadevlake` storage
-  account at all, not even as an account-level Unlocked default policy (the
-  lower-risk option originally chosen). The only way to enable it is
-  recreating the storage account, which holds the raw/curated/audit ADLS
-  zones already in use by identity-service — a genuinely destructive,
-  human-approval-required action per the guardrails, not something to do
-  as a side effect of this task. Needs a decision: (a) recreate the account
-  now in dev while data loss is cheap, (b) accept no WORM protection on
-  `audit` through the rest of Phase 1-2 and revisit before any real data
-  lands in it, or (c) some other compensating control (e.g. RBAC-only
-  write restriction + Cosmos `audit-hot` container as the real audit
-  source of truth, since REQ-NFR-021's blob copy may be secondary).
+  BLOCKED on an architecture decision, deeper than originally thought.
+  First found `immutableStorageWithVersioning` is create-time-only
+  (`PropertyIsImmutable` on update). With human approval, confirmed
+  `stigadevlake` was empty (checked raw/curated/audit via a transient
+  in-cluster pod — no blobs in any of them) and recreated it from scratch
+  with the property set at creation. That deployment failed too:
+  `FeatureNotSupportedForAccount`. Isolated the real cause with two throwaway
+  test storage accounts, one with `--hns true` one with `--hns false`,
+  identical `immutableStorageWithVersioning` config otherwise: the non-HNS
+  account succeeded, the HNS one failed identically. **Version-level WORM is
+  fundamentally incompatible with ADLS Gen2 (hierarchical namespace) on this
+  platform** — not a create-vs-update ordering problem, a hard platform
+  constraint. `stigadevlake` needs `isHnsEnabled: true` for its ADLS Gen2
+  role (REQ-INF-042), so this property cannot live on this account at all,
+  full stop.
+  (The recreate-and-restore also hit a secondary snag worth knowing about
+  for next time: deleting a storage account leaves its private endpoints in
+  a "Disconnected" state that Bicep can't update back — `az network
+  private-endpoint delete` and letting Bicep recreate them was the fix.
+  `stigadevlake` is fully restored now, `verify.sh` green, no data lost —
+  the account was confirmed empty throughout.)
+  Real options, none implemented yet:
+  (a) split `audit` into its own separate, non-HNS StorageV2 account with
+  `immutableStorageWithVersioning` enabled, leaving `raw`/`curated` on the
+  existing ADLS Gen2 account — satisfies REQ-NFR-021 literally, adds a
+  second storage account to manage;
+  (b) drop `isHnsEnabled` platform-wide and lose ADLS Gen2 (hierarchical
+  namespace, POSIX ACLs) for `raw`/`curated` too — simpler, but works
+  against REQ-INF-042's explicit ADLS Gen2 requirement;
+  (c) skip blob-level WORM for `audit` entirely — Cosmos `audit-hot`
+  (already effectively append-only in identity-service) as the real audit
+  source of truth, RBAC-restricted writes on the blob copy as a secondary,
+  non-WORM export;
+  (d) legacy time-based container-level immutability policies (the older
+  `immutabilityPolicies` sub-resource, not version-level) — may be
+  HNS-compatible since it works differently, but doesn't satisfy the
+  "version-level" wording in REQ-NFR-021 literally.
 - [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
   provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
   OIDC federated credential for the pipeline identity [HUMAN gate].

@@ -134,13 +134,16 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     networkAcls: { defaultAction: 'Deny', bypass: 'AzureServices' }
-    // REQ-NFR-021 / 1R.4: immutableStorageWithVersioning is create-time-only
-    // — confirmed via a failed deployment (PropertyIsImmutable) that it
-    // cannot be added to this already-existing storage account at all, not
-    // even as an Unlocked account-level default. Enabling it requires
-    // recreating st${cleanSuffix}lake, which is a deliberate, human-approved
-    // action (this account holds the raw/curated/audit ADLS zones already in
-    // use). See roadmap/PHASES.md 1R.4 for the decision this is blocked on.
+    // REQ-NFR-021 / 1R.4: immutableStorageWithVersioning is NOT applicable
+    // here — confirmed via isolated test accounts that it is fundamentally
+    // incompatible with isHnsEnabled: true (ADLS Gen2) on this platform
+    // (FeatureNotSupportedForAccount, reproduced with a minimal repro
+    // account; a non-HNS account with the identical property succeeds).
+    // This account needs HNS for its ADLS Gen2 role (raw/curated/audit data
+    // lake zones), so this property cannot live here at all, recreation or
+    // not. See roadmap/PHASES.md 1R.4 for the resulting architecture
+    // options (split audit into its own non-HNS account, drop HNS
+    // entirely, or a compensating control instead of blob-level WORM).
   }
 }
 
