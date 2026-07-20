@@ -135,3 +135,4 @@ echo "    member of the iga-platform-admins group (the SQL AAD admin). Run again
 echo "      CREATE USER [mi-${SUFFIX}-source-system-service] FROM EXTERNAL PROVIDER;"
 echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-source-system-service];"
 echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-source-system-service];"
+echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-source-system-service];  -- needed for Alembic's CREATE TABLE"

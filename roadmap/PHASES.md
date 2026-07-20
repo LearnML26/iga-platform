@@ -73,37 +73,34 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
 
 ## Phase 2 — Source systems & identity pipeline (spec §5.3)
 
-- [ ] **2.1 source-system-service scaffold** — REQ-COR-SRC-001. FastAPI
+- [x] **2.1 source-system-service scaffold** — REQ-COR-SRC-001. FastAPI
   service owning SourceSystemInstance + AttributeMapping + FeedRun tables in
   sqldb-sourcesystem (SQLAlchemy async, Alembic migrations, Entra token auth
   to SQL). CRUD APIs. Workload identity + manifests + verify.sh checks.
-  CODE/INFRA COMPLETE, blocked on one **[HUMAN]** step for verify.sh to go
-  green. Built: `src/source-system-service` (FastAPI, SQLAlchemy async +
-  aioodbc, Entra-token SQL auth via do_connect event — see app/db.py,
-  Alembic migrations), k8s manifest with a migrate Job that runs
-  `alembic upgrade head` before the Deployment rolls out, workload identity
-  + federated credential (`mi-iga-dev-source-system-service`), SQL 1433
-  egress added to the namespace default-deny NetworkPolicy, deploy.sh/CI
-  matrix updated, verify.sh smoke tests added.
-  Confirmed working end-to-end up to SQL Server itself: driver loads,
-  network path (private endpoint/NSG/DNS) resolves, Entra token auth
-  reaches the server and gets a real SQL-level response —
-  `Login failed for user '<token-identified principal>'` — because the
-  identity has no database user yet. Azure SQL's Entra permission model is
-  data-plane T-SQL, not ARM RBAC, and the server has publicNetworkAccess
-  Disabled, so this can only be run from inside the VNet, authenticated as
-  the SQL AAD admin (`iga-platform-admins`). Not something to script through
-  an ephemeral pod carrying a bearer token — that's credential-handling
-  the guardrails ask to avoid. **[HUMAN]** run, from inside the VNet
-  (e.g. `kubectl run` a sqlcmd pod, or Cloud Shell with VNet integration),
-  against `sqldb-sourcesystem`:
+  Done — verify.sh green end-to-end, including source-system-service
+  create/dedupe/mapping/feed-run checks. Built: `src/source-system-service`
+  (FastAPI, SQLAlchemy async + aioodbc, Entra-token SQL auth via do_connect
+  event — see app/db.py, Alembic migrations), k8s manifest with a migrate
+  Job that runs `alembic upgrade head` before the Deployment rolls out,
+  workload identity + federated credential
+  (`mi-iga-dev-source-system-service`), SQL 1433 egress added to the
+  namespace default-deny NetworkPolicy, deploy.sh/CI matrix updated,
+  verify.sh smoke tests added.
+  The SQL data-plane grant (Azure SQL's Entra permission model is T-SQL,
+  not ARM RBAC — the CREATE USER/ALTER ROLE below) was run by the human at
+  the operator's explicit request, using their own already-privileged
+  az session's token via a transient in-cluster pod (immediately deleted
+  after; not left as a reusable pattern in deploy.sh, which still prints
+  this as a manual step for a fresh environment). Full grant needed —
+  db_ddladmin was missing from the original instructions and had to be
+  added after Alembic's `CREATE TABLE alembic_version` failed with
+  permission denied (db_datawriter alone is DML-only, no DDL):
   ```sql
   CREATE USER [mi-iga-dev-source-system-service] FROM EXTERNAL PROVIDER;
   ALTER ROLE db_datareader ADD MEMBER [mi-iga-dev-source-system-service];
   ALTER ROLE db_datawriter ADD MEMBER [mi-iga-dev-source-system-service];
+  ALTER ROLE db_ddladmin  ADD MEMBER [mi-iga-dev-source-system-service];
   ```
-  Then re-run `./scripts/deploy.sh dev eastus <ADMIN_GROUP_OBJECT_ID>` (or
-  just `kubectl apply` the migrate Job again) and `./scripts/verify.sh`.
   Also found and fixed along the way (Dockerfile): msodbcsql18 needs
   `libgssapi-krb5-2` explicitly — `--no-install-recommends` silently
   dropped it, and unixODBC mis-reports the resulting missing transitive
@@ -111,6 +108,9 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   misleading. Also pinned the Microsoft apt repo to bookworm explicitly:
   python:3.12-slim's actual codename (trixie) fails APT's signature
   verification against Microsoft's repo for that release.
+  Note: db_ddladmin is broader than the running service strictly needs
+  (it's shared by both the app Deployment and the migrate Job via one
+  identity) — worth splitting into a migration-only identity before prod.
 - [ ] **2.2 Flat-file connector** — REQ-COR-SRC-002. Ingest CSV from the
   ADLS `raw/` container (blob drop), mapping-driven schema, malformed-row
   quarantine, checksum validation. FeedRun produces delta summary
