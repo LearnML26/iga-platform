@@ -134,10 +134,49 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   Note: db_ddladmin is broader than the running service strictly needs
   (it's shared by both the app Deployment and the migrate Job via one
   identity) — worth splitting into a migration-only identity before prod.
-- [ ] **2.2 Flat-file connector** — REQ-COR-SRC-002. Ingest CSV from the
+- [x] **2.2 Flat-file connector** — REQ-COR-SRC-002. Ingest CSV from the
   ADLS `raw/` container (blob drop), mapping-driven schema, malformed-row
   quarantine, checksum validation. FeedRun produces delta summary
   (REQ-COR-ID-006): added/updated/terminated/unmatched.
+  Done — verify.sh green (health, ingest round-trip asserting the delta
+  summary). Built `src/flatfile-connector-service`: a stateless FastAPI
+  service with no database of its own — SourceSystemInstance/
+  AttributeMapping/FeedRun already live in source-system-service (2.1), so
+  this connector reads mappings and reports results there over HTTP instead
+  of duplicating tables. Added `PATCH /feed-runs/{id}` to
+  source-system-service for that reporting. Workload identity +
+  `Storage Blob Data Contributor` on `stigadevlake` (RBAC-only, no
+  keys/SAS). Mapping-driven schema uses a small fixed set of named
+  transforms (upper/lower/strip/title); an unrecognized transform name is
+  a no-op, noted in errorSummary rather than failing the row. Malformed
+  rows (missing/empty key attribute value, or a transform exception) are
+  quarantined to `raw/quarantine/<instanceId>/<feedRunId>.csv` with the
+  original row plus row number + reason; a missing *mapped* column in the
+  file header fails the whole run instead (config problem, not bad data).
+  Checksum validation prefers a `<blob>.md5` sidecar (works regardless of
+  upload method) and falls back to the blob's own Content-MD5 property;
+  if neither exists it proceeds but says so in errorSummary — there's
+  nothing to verify against, so this isn't treated as fatal. Verified all
+  four delta branches with a two-run fixture in-cluster (added 2 / updated
+  0 / terminated 0 / unmatched 2 → added 2 / updated 1 / terminated 1 /
+  unmatched 0) plus a deliberately-corrupted checksum producing a clean
+  `failed` FeedRun with 0 counts.
+  **Scoped limitation, by design**: 2.3 (identity-service integration)
+  doesn't exist yet, so added/updated/terminated are computed against the
+  connector's *own* previous-snapshot file at
+  `curated/source-state/<instanceId>/latest.json`, not real identity
+  records — and each feed file is assumed to be a full population
+  snapshot (a key missing from the file = terminated), which won't hold
+  for incremental files once 2.4 lands. "unmatched" is repurposed for this
+  phase as *ambiguous correlation*: two-or-more rows in the same file
+  resolving to the same key (can't tell which is authoritative, so neither
+  is applied and the previous snapshot entry for that key is left
+  untouched). All of this gets superseded by real identity-service
+  correlation in 2.3 — see app/ingest.py docstring for the full reasoning.
+  Also: ingestion is synchronous, triggered via `POST /ingest` with an
+  explicit blob path — no blob-created event trigger yet (fine for now;
+  2.4 already flags a scheduler loop as a follow-up for lifecycle, and a
+  blob-trigger would be the natural pairing then).
 - [ ] **2.3 Feed → Identity Service integration** — REQ-COR-SRC-006. Apply
   deltas through identity-service APIs (never direct DB). Emit
   IdentityCreated/Updated/Terminated events. Failure threshold halts apply
