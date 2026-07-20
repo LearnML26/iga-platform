@@ -30,6 +30,8 @@ spec:
             - { name: COSMOS_ENDPOINT,     value: "https://${COSMOS_ACCOUNT}.documents.azure.com:443/" }
             - { name: EVENTHUB_NAMESPACE,  value: "${EVENTHUB_NAMESPACE}.servicebus.windows.net" }
             - { name: EVENTHUB_NAME,       value: "identity-changes" }
+            - { name: ENTRA_TENANT_ID,     value: "${ENTRA_TENANT_ID}" }
+            - { name: API_AUDIENCE,        value: "${API_AUDIENCE}" }
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 10

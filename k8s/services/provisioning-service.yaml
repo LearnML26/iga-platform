@@ -29,6 +29,8 @@ spec:
           env:
             - { name: SERVICEBUS_NAMESPACE, value: "${SERVICEBUS_NAMESPACE}.servicebus.windows.net" }
             - { name: MAX_ATTEMPTS,         value: "5" }
+            - { name: ENTRA_TENANT_ID,      value: "${ENTRA_TENANT_ID}" }
+            - { name: API_AUDIENCE,         value: "${API_AUDIENCE}" }
             - name: AD_SERVER
               valueFrom: { secretKeyRef: { name: ad-connector, key: server, optional: true } }
             - name: AD_BIND_DN

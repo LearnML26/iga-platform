@@ -5,3 +5,4 @@ azure-identity==1.17.*
 azure-cosmos==4.7.*
 azure-eventhub==5.12.*
 aiohttp==3.10.*
+pyjwt[crypto]==2.9.*

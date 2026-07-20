@@ -41,6 +41,7 @@ COSMOS_ACCOUNT=$(echo "$DEPLOY_OUT"  | python3 -c "import sys,json;print(json.lo
 SB_NAMESPACE=$(echo "$DEPLOY_OUT"    | python3 -c "import sys,json;print(json.load(sys.stdin)['serviceBusNamespace']['value'])")
 EVH_NAMESPACE=$(echo "$DEPLOY_OUT"   | python3 -c "import sys,json;print(json.load(sys.stdin)['eventHubNamespace']['value'])")
 SQL_SERVER_NAME=$(echo "$DEPLOY_OUT" | python3 -c "import sys,json;print(json.load(sys.stdin)['sqlServerName']['value'])")
+STORAGE_ACCOUNT=$(echo "$DEPLOY_OUT" | python3 -c "import sys,json;print(json.load(sys.stdin)['storageAccountName']['value'])")
 RG_COMPUTE=$(echo "$DEPLOY_OUT"      | python3 -c "import sys,json;print(json.load(sys.stdin)['computeResourceGroup']['value'])")
 RG_DATA=$(echo "$DEPLOY_OUT"         | python3 -c "import sys,json;print(json.load(sys.stdin)['dataResourceGroup']['value'])")
 
@@ -50,7 +51,7 @@ kubelogin convert-kubeconfig -l azurecli
 OIDC_ISSUER=$(az aks show -g "$RG_COMPUTE" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 
 declare -A SVC_CLIENT_IDS
-for SVC in identity-service provisioning-service source-system-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service; do
   MI_NAME="mi-${SUFFIX}-${SVC}"
   az identity create -g "$RG_COMPUTE" -n "$MI_NAME" -l "$LOCATION" -o none
   CLIENT_ID=$(az identity show -g "$RG_COMPUTE" -n "$MI_NAME" --query clientId -o tsv)
@@ -83,8 +84,16 @@ az role assignment create --assignee "$PRV_PRINCIPAL" \
   --role "Azure Service Bus Data Owner" \
   --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
 
+# Storage Blob Data Contributor for the flat-file connector (2.2) — read raw/,
+# write raw/quarantine/ and curated/source-state/. No SAS/keys: the storage
+# account has key-based auth off by default posture (RBAC-only data plane).
+FFC_PRINCIPAL=$(az identity show -g "$RG_COMPUTE" -n "mi-${SUFFIX}-flatfile-connector-service" --query principalId -o tsv)
+az role assignment create --assignee "$FFC_PRINCIPAL" \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" -o none || true
+
 echo "==> [4/5] Building and pushing images (ACR server-side build — no local Docker needed)"
-for SVC in identity-service provisioning-service source-system-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service; do
   # az acr build uploads the context, builds in ACR, and pushes the image
   # to ${ACR_LOGIN_SERVER}/${SVC}:${IMAGE_TAG} automatically on success.
   az acr build \
@@ -102,6 +111,10 @@ export SQL_SERVER_FQDN="${SQL_SERVER_NAME}.database.windows.net"
 export IDENTITY_SVC_CLIENT_ID="${SVC_CLIENT_IDS[identity-service]}"
 export PROVISIONING_SVC_CLIENT_ID="${SVC_CLIENT_IDS[provisioning-service]}"
 export SOURCE_SYSTEM_SVC_CLIENT_ID="${SVC_CLIENT_IDS[source-system-service]}"
+export FLATFILE_CONNECTOR_SVC_CLIENT_ID="${SVC_CLIENT_IDS[flatfile-connector-service]}"
+export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
+export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
+export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv)"
 for F in k8s/services/*.yaml; do
   envsubst < "$F" | kubectl apply -f -
 done

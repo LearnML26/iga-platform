@@ -27,6 +27,8 @@ from azure.cosmos import exceptions as cosmos_exceptions
 from azure.eventhub.aio import EventHubProducerClient
 from azure.eventhub import EventData
 
+from .auth import require_role
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("identity-service")
 
@@ -163,7 +165,7 @@ async def readyz():
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-@app.post("/identities", response_model=Identity, status_code=201)
+@app.post("/identities", response_model=Identity, status_code=201, dependencies=[require_role("identities.write")])
 async def create_identity(body: IdentityIn):
     # Deterministic correlation: reject duplicate correlationKey (REQ-COR-ID-002)
     existing = [
@@ -192,7 +194,7 @@ async def create_identity(body: IdentityIn):
     return doc
 
 
-@app.get("/identities/{identity_id}", response_model=Identity)
+@app.get("/identities/{identity_id}", response_model=Identity, dependencies=[require_role("identities.read")])
 async def get_identity(identity_id: str):
     try:
         return await app.state.identities.read_item(item=identity_id, partition_key=TENANT_ID)
@@ -200,7 +202,7 @@ async def get_identity(identity_id: str):
         raise HTTPException(status_code=404, detail="identity not found")
 
 
-@app.patch("/identities/{identity_id}", response_model=Identity)
+@app.patch("/identities/{identity_id}", response_model=Identity, dependencies=[require_role("identities.write")])
 async def update_identity(identity_id: str, patch: dict):
     try:
         before = await app.state.identities.read_item(item=identity_id, partition_key=TENANT_ID)
@@ -226,7 +228,7 @@ async def update_identity(identity_id: str, patch: dict):
     return after
 
 
-@app.get("/identities")
+@app.get("/identities", dependencies=[require_role("identities.read")])
 async def search_identities(
     department: Optional[str] = None,
     status: Optional[IdentityStatus] = None,
@@ -248,7 +250,7 @@ async def search_identities(
     return [item async for item in app.state.identities.query_items(query=query, parameters=params)]
 
 
-@app.get("/identities/{identity_id}/history")
+@app.get("/identities/{identity_id}/history", dependencies=[require_role("identities.read")])
 async def get_history(identity_id: str, limit: int = Query(50, le=200)):
     return [
         item async for item in app.state.history.query_items(

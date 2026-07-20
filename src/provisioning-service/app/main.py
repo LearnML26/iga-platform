@@ -30,6 +30,7 @@ from azure.servicebus.aio import ServiceBusClient
 from azure.servicebus import ServiceBusMessage
 
 from .connectors import CONNECTOR_REGISTRY, ConnectorError
+from .auth import require_role
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("provisioning-service")
@@ -99,7 +100,7 @@ async def readyz():
 # Task submission API (called by Access Request / RBAC / Certification / Rules
 # services — REQ-COR-PROV-001)
 # ---------------------------------------------------------------------------
-@app.post("/tasks", status_code=202)
+@app.post("/tasks", status_code=202, dependencies=[require_role("provisioning.write")])
 async def submit_task(task: ProvisioningTask):
     task.taskId = task.taskId or str(uuid.uuid4())
     session_id = f"{task.identityId}:{task.instanceId}"  # ordering scope
