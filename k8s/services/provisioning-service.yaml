@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: provisioning-service
+  namespace: iga
+  annotations:
+    azure.workload.identity/client-id: "${PROVISIONING_SVC_CLIENT_ID}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provisioning-service
+  namespace: iga
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: provisioning-service }
+  template:
+    metadata:
+      labels:
+        app: provisioning-service
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: provisioning-service
+      containers:
+        - name: provisioning-service
+          image: ${ACR_LOGIN_SERVER}/provisioning-service:${IMAGE_TAG}
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: SERVICEBUS_NAMESPACE, value: "${SERVICEBUS_NAMESPACE}.servicebus.windows.net" }
+            - { name: MAX_ATTEMPTS,         value: "5" }
+            - name: AD_SERVER
+              valueFrom: { secretKeyRef: { name: ad-connector, key: server, optional: true } }
+            - name: AD_BIND_DN
+              valueFrom: { secretKeyRef: { name: ad-connector, key: bind-dn, optional: true } }
+            - name: AD_BIND_PASSWORD
+              valueFrom: { secretKeyRef: { name: ad-connector, key: bind-password, optional: true } }
+            - name: AD_BASE_DN
+              valueFrom: { secretKeyRef: { name: ad-connector, key: base-dn, optional: true } }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provisioning-service
+  namespace: iga
+spec:
+  selector: { app: provisioning-service }
+  ports: [{ port: 80, targetPort: 8080 }]
