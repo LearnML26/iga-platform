@@ -16,9 +16,25 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   `iga-dev-1r1-1784519192`, Succeeded); confirmed `kv-iga-dev` A record now
   Bicep-managed (it existed pre-fix from manual CLI drift — Bicep now matches
   live state); verify.sh green.
-- [ ] **1R.2 Verify all six DNS zones registered** — every zone in
+- [x] **1R.2 Verify all six DNS zones registered** — every zone in
   rg-iga-dev-network shows ≥2 record sets; create any missing zone groups
   via CLI AND ensure Bicep matches.
+  Done, with scope correction: there are actually 7 zones (network.bicep),
+  not 6. Root cause for the empty `privatelink.servicebus.windows.net` zone
+  wasn't a missing zone group — Service Bus and Event Hubs had **no private
+  endpoints at all** (messaging.bicep never defined them; both namespaces
+  had publicNetworkAccess Enabled). Added a PE + DNS zone group for Event
+  Hubs only (messaging.bicep, main.bicep dataSubnetId wiring, network.bicep
+  NSG rule `allow-aks-to-messaging-amqp` on 5671). Service Bus is
+  permanently excluded from PE in dev: Azure only supports private
+  endpoints on **Premium** Service Bus namespaces (confirmed via a failed
+  deployment, `PrivateEndpointInvalidSku`), and CLAUDE.md forbids Premium
+  SKUs in dev — this is a platform constraint, not a gap to close later
+  without a cost-policy decision. publicNetworkAccess left Enabled on both
+  namespaces for now (data-plane auth is already Entra-only via
+  disableLocalAuth); disabling it is a follow-up once Event Hub's PE path
+  is trusted in production traffic. verify.sh green, no regression to
+  identity-service/provisioning-service.
 - [ ] **1R.3 API authentication (JWT validation)** — REQ-COR-API-001/002
   (minimal slice). Add Entra ID JWT validation middleware to identity-service
   and provisioning-service: validate tokens against the tenant's JWKS,
@@ -31,6 +47,20 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   version-level WORM policy to the `audit` container via CLI; document why
   it can't be pure Bicep (follow-up call), or implement via deployment script
   resource if clean.
+  BLOCKED, documented (not implemented): `immutableStorageWithVersioning`
+  is create-time-only — confirmed via a failed deployment (`PropertyIsImmutable`)
+  that it cannot be added to the already-existing `stigadevlake` storage
+  account at all, not even as an account-level Unlocked default policy (the
+  lower-risk option originally chosen). The only way to enable it is
+  recreating the storage account, which holds the raw/curated/audit ADLS
+  zones already in use by identity-service — a genuinely destructive,
+  human-approval-required action per the guardrails, not something to do
+  as a side effect of this task. Needs a decision: (a) recreate the account
+  now in dev while data loss is cheap, (b) accept no WORM protection on
+  `audit` through the rest of Phase 1-2 and revisit before any real data
+  lands in it, or (c) some other compensating control (e.g. RBAC-only
+  write restriction + Cosmos `audit-hot` container as the real audit
+  source of truth, since REQ-NFR-021's blob copy may be secondary).
 - [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
   provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
   OIDC federated credential for the pipeline identity [HUMAN gate].
@@ -47,6 +77,40 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   service owning SourceSystemInstance + AttributeMapping + FeedRun tables in
   sqldb-sourcesystem (SQLAlchemy async, Alembic migrations, Entra token auth
   to SQL). CRUD APIs. Workload identity + manifests + verify.sh checks.
+  CODE/INFRA COMPLETE, blocked on one **[HUMAN]** step for verify.sh to go
+  green. Built: `src/source-system-service` (FastAPI, SQLAlchemy async +
+  aioodbc, Entra-token SQL auth via do_connect event — see app/db.py,
+  Alembic migrations), k8s manifest with a migrate Job that runs
+  `alembic upgrade head` before the Deployment rolls out, workload identity
+  + federated credential (`mi-iga-dev-source-system-service`), SQL 1433
+  egress added to the namespace default-deny NetworkPolicy, deploy.sh/CI
+  matrix updated, verify.sh smoke tests added.
+  Confirmed working end-to-end up to SQL Server itself: driver loads,
+  network path (private endpoint/NSG/DNS) resolves, Entra token auth
+  reaches the server and gets a real SQL-level response —
+  `Login failed for user '<token-identified principal>'` — because the
+  identity has no database user yet. Azure SQL's Entra permission model is
+  data-plane T-SQL, not ARM RBAC, and the server has publicNetworkAccess
+  Disabled, so this can only be run from inside the VNet, authenticated as
+  the SQL AAD admin (`iga-platform-admins`). Not something to script through
+  an ephemeral pod carrying a bearer token — that's credential-handling
+  the guardrails ask to avoid. **[HUMAN]** run, from inside the VNet
+  (e.g. `kubectl run` a sqlcmd pod, or Cloud Shell with VNet integration),
+  against `sqldb-sourcesystem`:
+  ```sql
+  CREATE USER [mi-iga-dev-source-system-service] FROM EXTERNAL PROVIDER;
+  ALTER ROLE db_datareader ADD MEMBER [mi-iga-dev-source-system-service];
+  ALTER ROLE db_datawriter ADD MEMBER [mi-iga-dev-source-system-service];
+  ```
+  Then re-run `./scripts/deploy.sh dev eastus <ADMIN_GROUP_OBJECT_ID>` (or
+  just `kubectl apply` the migrate Job again) and `./scripts/verify.sh`.
+  Also found and fixed along the way (Dockerfile): msodbcsql18 needs
+  `libgssapi-krb5-2` explicitly — `--no-install-recommends` silently
+  dropped it, and unixODBC mis-reports the resulting missing transitive
+  dependency as "file not found" on the driver's own .so, which is
+  misleading. Also pinned the Microsoft apt repo to bookworm explicitly:
+  python:3.12-slim's actual codename (trixie) fails APT's signature
+  verification against Microsoft's repo for that release.
 - [ ] **2.2 Flat-file connector** — REQ-COR-SRC-002. Ingest CSV from the
   ADLS `raw/` container (blob drop), mapping-driven schema, malformed-row
   quarantine, checksum validation. FeedRun produces delta summary
