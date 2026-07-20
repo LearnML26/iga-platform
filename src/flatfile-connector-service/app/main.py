@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from .ingest import run_ingestion
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("azure").setLevel(logging.WARNING)  # SDK HTTP pipeline logging is very verbose at INFO
 log = logging.getLogger("flatfile-connector-service")
 
 app = FastAPI(title="IGA Flat-File Connector Service", version="1.0.0")
