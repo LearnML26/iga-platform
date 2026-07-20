@@ -6,6 +6,7 @@ param location string
 param suffix string
 param tags object
 param isProd bool
+param dataSubnetId string
 
 resource sb 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: 'sb-${suffix}'
@@ -75,6 +76,60 @@ resource auditConsumer 'Microsoft.EventHub/namespaces/eventhubs/consumergroups@2
   parent: identityChanges
   name: 'audit-service'
 }
+
+// ---------------------------------------------------------------------------
+// Private endpoints (REQ-INF-013) — 1R.2: previously missing entirely.
+// publicNetworkAccess is left as-is (Enabled in dev) for this task; disabling
+// it for namespaces that get a PE is a deliberate follow-up once the private
+// path here is verified, since identity-service/provisioning-service depend
+// on live connectivity to these namespaces today.
+//
+// Service Bus is EXCLUDED: Azure only supports private endpoints on Premium
+// Service Bus namespaces (confirmed via failed deployment,
+// PrivateEndpointInvalidSku), and CLAUDE.md forbids Premium SKUs in dev.
+// sb-${suffix} (Standard tier) therefore cannot be network-isolated in dev
+// at all — this is an Azure platform constraint, not a config gap. It stays
+// on public access with Entra-only data-plane auth (disableLocalAuth) as its
+// sole access control until a decision is made to run Premium in dev or
+// accept this gap through to prod (prod already provisions Premium).
+// ---------------------------------------------------------------------------
+var messagingPrivateEndpoints = [
+  { name: 'eventhub', resourceId: eh.id, groupId: 'namespace' }
+]
+
+resource messagingPes 'Microsoft.Network/privateEndpoints@2024-01-01' = [for pe in messagingPrivateEndpoints: {
+  name: 'pe-${suffix}-${pe.name}'
+  location: location
+  tags: tags
+  properties: {
+    subnet: { id: dataSubnetId }
+    privateLinkServiceConnections: [
+      {
+        name: pe.name
+        properties: {
+          privateLinkServiceId: pe.resourceId
+          groupIds: [pe.groupId]
+        }
+      }
+    ]
+  }
+}]
+
+// Service Bus and Event Hubs both resolve through privatelink.servicebus.windows.net
+resource messagingPeDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-01-01' = [for (pe, i) in messagingPrivateEndpoints: {
+  parent: messagingPes[i]
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: pe.name
+        properties: {
+          privateDnsZoneId: resourceId('rg-${suffix}-network', 'Microsoft.Network/privateDnsZones', 'privatelink.servicebus.windows.net')
+        }
+      }
+    ]
+  }
+}]
 
 output serviceBusNamespace string = sb.name
 output eventHubNamespace string = eh.name

@@ -102,6 +102,20 @@ resource nsgData 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
           destinationPortRange: '1433'
         }
       }
+      {
+        // Service Bus / Event Hubs AMQP-over-TLS private endpoints (1R.2)
+        name: 'allow-aks-to-messaging-amqp'
+        properties: {
+          priority: 120
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: '10.20.4.0/22'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '10.20.8.0/24'
+          destinationPortRange: '5671'
+        }
+      }
     ]
   }
 }

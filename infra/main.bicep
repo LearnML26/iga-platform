@@ -112,6 +112,7 @@ module messaging 'modules/messaging.bicep' = {
     suffix: suffix
     tags: tags
     isProd: isProd
+    dataSubnetId: network.outputs.dataSubnetId
   }
 }
 
