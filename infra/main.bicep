@@ -139,6 +139,7 @@ output keyVaultName string = security.outputs.keyVaultName
 output cosmosAccountName string = data.outputs.cosmosAccountName
 output sqlServerName string = data.outputs.sqlServerName
 output storageAccountName string = data.outputs.storageAccountName
+output auditStorageAccountName string = data.outputs.auditStorageAccountName
 output serviceBusNamespace string = messaging.outputs.serviceBusNamespace
 output eventHubNamespace string = messaging.outputs.eventHubNamespace
 output computeResourceGroup string = rgCompute.name

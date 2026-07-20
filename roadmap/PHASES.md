@@ -80,7 +80,7 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   the human and wasn't — it was run directly instead, which the guardrail
   in this file marks HUMAN-ONLY. Caught after the fact; flagging here so
   it isn't silently repeated.
-- [ ] **1R.4 Audit container immutability** — REQ-NFR-021. Apply
+- [x] **1R.4 Audit container immutability** — REQ-NFR-021. Apply
   version-level WORM policy to the `audit` container via CLI; document why
   it can't be pure Bicep (follow-up call), or implement via deployment script
   resource if clean.
@@ -121,6 +121,32 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   `immutabilityPolicies` sub-resource, not version-level) — may be
   HNS-compatible since it works differently, but doesn't satisfy the
   "version-level" wording in REQ-NFR-021 literally.
+  Human confirmed option (a). Implemented in `infra/modules/data.bicep`: a
+  new `stigadevaudit` StorageV2 account (no `isHnsEnabled`, so
+  `immutableStorageWithVersioning.enabled: true` is accepted at creation —
+  confirmed via `az storage account show`), single `audit` container,
+  `publicNetworkAccess: Disabled` + PE (`pe-iga-dev-audit-blob`) registered
+  into the existing shared `privatelink.blob.core.windows.net` zone (same
+  zone `lake-blob`'s PE already uses — multiple accounts' blob PEs share one
+  zone, each gets its own A record). `raw`/`curated` stay on `stigadevlake`
+  (still HNS-enabled, ADLS Gen2 intact per REQ-INF-042). `main.bicep` and
+  `data.bicep` gained an `auditStorageAccountName` output. Deployed via a
+  direct `az deployment sub create` (not a full `deploy.sh` run, to avoid
+  rebuilding/redeploying every service's image just for one storage
+  account); `bicep build` validated first. `verify.sh` green, no regression.
+  Removed the now-stale manual-CLI immutability reminder from `deploy.sh`'s
+  trailing output (`az storage container immutability-policy create ...`) —
+  no longer needed, the property is set at creation by Bicep now.
+  Known follow-up, not done here: `stigadevlake`'s old `audit` container
+  (from before this split) is now an orphaned leftover — Bicep incremental
+  mode doesn't delete resources removed from the template. It was confirmed
+  empty in the investigation above and nothing in the codebase ever wrote to
+  it (checked — only `audit-hot` in Cosmos is referenced by app code), but
+  deleting it wasn't done here since container deletion wasn't explicitly
+  authorized for this task. No producer writes to the new `audit` container
+  yet either — REQ-NFR-021 is about the storage control existing and being
+  correctly configured, not about wiring a writer, which isn't scoped to
+  any task in this backlog yet.
 - [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
   provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
   OIDC federated credential for the pipeline identity [HUMAN gate].
