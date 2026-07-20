@@ -65,6 +65,36 @@ echo "$OUT" | grep -q "$KEY" && ok "identity search returns created record" || b
 OUT=$(run_curl vrfy-prov-health http://provisioning-service/healthz)
 echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "provisioning-service /healthz 200" || bad "provisioning health failed: $OUT"
 
+# source-system-service: health, create, dedupe (unique name), mapping, feed run
+SRC_NAME="vrfy-src-$(date +%s)"
+OUT=$(run_curl vrfy-src-health http://source-system-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "source-system-service /healthz 200" || bad "source-system-service health failed: $OUT"
+
+OUT=$(run_curl vrfy-src-create -X POST http://source-system-service/source-systems \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$SRC_NAME\",\"connectorType\":\"flat-file\",\"description\":\"verify probe\"}")
+echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "source system create 201 ($SRC_NAME)" || bad "source system create failed: $OUT"
+SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+OUT=$(run_curl vrfy-src-dedupe -X POST http://source-system-service/source-systems \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$SRC_NAME\",\"connectorType\":\"flat-file\"}")
+echo "$OUT" | grep -q 'HTTP_STATUS:409' && ok "source system name uniqueness 409" || bad "source system dedupe check failed: $OUT"
+
+if [ -n "${SRC_ID:-}" ]; then
+  OUT=$(run_curl vrfy-src-mapping -X POST "http://source-system-service/source-systems/${SRC_ID}/mappings" \
+    -H 'Content-Type: application/json' \
+    -d '{"sourceAttribute":"emp_id","targetAttribute":"correlationKey","isKey":true}')
+  echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "attribute mapping create 201" || bad "attribute mapping create failed: $OUT"
+
+  OUT=$(run_curl vrfy-src-feedrun -X POST "http://source-system-service/source-systems/${SRC_ID}/feed-runs" \
+    -H 'Content-Type: application/json' \
+    -d '{"triggeredBy":"verify"}')
+  echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "feed run create 201" || bad "feed run create failed: $OUT"
+else
+  bad "source system id not captured — skipped mapping/feed-run checks"
+fi
+
 echo "== Infra spot checks =="
 for Z in privatelink.documents.azure.com privatelink.vaultcore.azure.net; do
   N=$(az network private-dns record-set a list -g rg-iga-dev-network -z "$Z" --query "length(@)" -o tsv 2>/dev/null || echo 0)

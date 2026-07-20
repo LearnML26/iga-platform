@@ -22,6 +22,7 @@ spec:
         - { protocol: TCP, port: 443 }
         - { protocol: TCP, port: 636 }   # LDAPS for AD connector
         - { protocol: TCP, port: 5671 }  # AMQP-over-TLS for Service Bus/Event Hubs
+        - { protocol: TCP, port: 1433 }  # Azure SQL (source-system-service, Phase 2.1)
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

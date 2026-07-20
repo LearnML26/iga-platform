@@ -40,6 +40,7 @@ ACR_LOGIN_SERVER=$(echo "$DEPLOY_OUT"| python3 -c "import sys,json;print(json.lo
 COSMOS_ACCOUNT=$(echo "$DEPLOY_OUT"  | python3 -c "import sys,json;print(json.load(sys.stdin)['cosmosAccountName']['value'])")
 SB_NAMESPACE=$(echo "$DEPLOY_OUT"    | python3 -c "import sys,json;print(json.load(sys.stdin)['serviceBusNamespace']['value'])")
 EVH_NAMESPACE=$(echo "$DEPLOY_OUT"   | python3 -c "import sys,json;print(json.load(sys.stdin)['eventHubNamespace']['value'])")
+SQL_SERVER_NAME=$(echo "$DEPLOY_OUT" | python3 -c "import sys,json;print(json.load(sys.stdin)['sqlServerName']['value'])")
 RG_COMPUTE=$(echo "$DEPLOY_OUT"      | python3 -c "import sys,json;print(json.load(sys.stdin)['computeResourceGroup']['value'])")
 RG_DATA=$(echo "$DEPLOY_OUT"         | python3 -c "import sys,json;print(json.load(sys.stdin)['dataResourceGroup']['value'])")
 
@@ -49,7 +50,7 @@ kubelogin convert-kubeconfig -l azurecli
 OIDC_ISSUER=$(az aks show -g "$RG_COMPUTE" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 
 declare -A SVC_CLIENT_IDS
-for SVC in identity-service provisioning-service; do
+for SVC in identity-service provisioning-service source-system-service; do
   MI_NAME="mi-${SUFFIX}-${SVC}"
   az identity create -g "$RG_COMPUTE" -n "$MI_NAME" -l "$LOCATION" -o none
   CLIENT_ID=$(az identity show -g "$RG_COMPUTE" -n "$MI_NAME" --query clientId -o tsv)
@@ -83,7 +84,7 @@ az role assignment create --assignee "$PRV_PRINCIPAL" \
   --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
 
 echo "==> [4/5] Building and pushing images (ACR server-side build — no local Docker needed)"
-for SVC in identity-service provisioning-service; do
+for SVC in identity-service provisioning-service source-system-service; do
   # az acr build uploads the context, builds in ACR, and pushes the image
   # to ${ACR_LOGIN_SERVER}/${SVC}:${IMAGE_TAG} automatically on success.
   az acr build \
@@ -97,11 +98,27 @@ kubectl apply -f k8s/base/namespace.yaml
 export ACR_LOGIN_SERVER IMAGE_TAG COSMOS_ACCOUNT
 export EVENTHUB_NAMESPACE="$EVH_NAMESPACE"
 export SERVICEBUS_NAMESPACE="$SB_NAMESPACE"
+export SQL_SERVER_FQDN="${SQL_SERVER_NAME}.database.windows.net"
 export IDENTITY_SVC_CLIENT_ID="${SVC_CLIENT_IDS[identity-service]}"
 export PROVISIONING_SVC_CLIENT_ID="${SVC_CLIENT_IDS[provisioning-service]}"
+export SOURCE_SYSTEM_SVC_CLIENT_ID="${SVC_CLIENT_IDS[source-system-service]}"
 for F in k8s/services/*.yaml; do
   envsubst < "$F" | kubectl apply -f -
 done
+
+# source-system-service ships an Alembic migrate Job alongside its Deployment
+# (see k8s/services/source-system-service.yaml). Wait for it, then roll the
+# Deployment so pods restart cleanly against the finished schema rather than
+# racing it on first request.
+if kubectl get job/source-system-service-migrate -n iga > /dev/null 2>&1; then
+  echo "==> waiting for source-system-service-migrate Job"
+  if kubectl wait --for=condition=complete job/source-system-service-migrate -n iga --timeout=180s; then
+    kubectl rollout restart deployment/source-system-service -n iga
+  else
+    echo "!! migrate Job did not complete — check: kubectl logs -n iga job/source-system-service-migrate"
+    echo "!! this is very likely the SQL permission grant below not having been run yet"
+  fi
+fi
 
 echo ""
 echo "=== Deployment complete ==="
@@ -111,3 +128,10 @@ echo "Next steps:"
 echo "  - Store AD connector bind credentials in Key Vault kv-${SUFFIX} and sync to the 'ad-connector' k8s secret via CSI SecretProviderClass"
 echo "  - Grant the Entra connector managed identity Graph GroupMember.ReadWrite.All (admin consent required)"
 echo "  - Apply audit container immutability: az storage container immutability-policy create ..."
+echo "  - [ONE-TIME, HUMAN] Grant source-system-service's managed identity access to sqldb-sourcesystem."
+echo "    sql-${SUFFIX} has publicNetworkAccess Disabled, so this SQL must run from inside the VNet"
+echo "    (e.g. a kubectl run sqlcmd pod, or Cloud Shell with VNet integration), authenticated as a"
+echo "    member of the iga-platform-admins group (the SQL AAD admin). Run against sqldb-sourcesystem:"
+echo "      CREATE USER [mi-${SUFFIX}-source-system-service] FROM EXTERNAL PROVIDER;"
+echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-source-system-service];"
+echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-source-system-service];"
