@@ -134,6 +134,13 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     networkAcls: { defaultAction: 'Deny', bypass: 'AzureServices' }
+    // REQ-NFR-021 / 1R.4: immutableStorageWithVersioning is create-time-only
+    // — confirmed via a failed deployment (PropertyIsImmutable) that it
+    // cannot be added to this already-existing storage account at all, not
+    // even as an Unlocked account-level default. Enabling it requires
+    // recreating st${cleanSuffix}lake, which is a deliberate, human-approved
+    // action (this account holds the raw/curated/audit ADLS zones already in
+    // use). See roadmap/PHASES.md 1R.4 for the decision this is blocked on.
   }
 }
 
