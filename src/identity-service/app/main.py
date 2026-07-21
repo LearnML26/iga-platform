@@ -239,13 +239,17 @@ async def search_identities(
     """Faceted search (REQ-COR-ID-009)."""
     clauses, params = ["c.tenantId = @t"], [{"name": "@t", "value": TENANT_ID}]
     if department:
-        clauses.append("c.department = @d"); params.append({"name": "@d", "value": department})
+        clauses.append("c.department = @d")
+        params.append({"name": "@d", "value": department})
     if status:
-        clauses.append("c.status = @s"); params.append({"name": "@s", "value": status.value})
+        clauses.append("c.status = @s")
+        params.append({"name": "@s", "value": status.value})
     if manager:
-        clauses.append("c.managerIdentityId = @m"); params.append({"name": "@m", "value": manager})
+        clauses.append("c.managerIdentityId = @m")
+        params.append({"name": "@m", "value": manager})
     if q:
-        clauses.append("CONTAINS(LOWER(c.displayName), LOWER(@q))"); params.append({"name": "@q", "value": q})
+        clauses.append("CONTAINS(LOWER(c.displayName), LOWER(@q))")
+        params.append({"name": "@q", "value": q})
     query = f"SELECT * FROM c WHERE {' AND '.join(clauses)} OFFSET 0 LIMIT {limit}"
     return [item async for item in app.state.identities.query_items(query=query, parameters=params)]
 

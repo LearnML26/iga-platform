@@ -9,7 +9,6 @@ environment variables that the AKS CSI Secret Store driver mounts from
 Key Vault (REQ-INF-061/062) — never hardcoded.
 """
 import os
-import json
 import logging
 from abc import ABC, abstractmethod
 
