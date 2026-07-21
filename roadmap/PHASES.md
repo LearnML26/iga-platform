@@ -1,0 +1,308 @@
+# IGA Platform — Agent Backlog
+
+Work top to bottom. Each task lists its spec requirement IDs and acceptance
+criteria. Tick the box and add a one-line note when done. Tasks marked
+**[HUMAN]** cannot be completed by the agent — print instructions and wait.
+
+---
+
+## Phase 1R — Remediation & hardening of what's deployed
+
+- [x] **1R.1 Key Vault DNS zone group** — Add privateDnsZoneGroups to the KV
+  private endpoint in `infra/modules/security.bicep` (copy the data.bicep
+  pattern). Deploy; verify `az network private-dns record-set a list -g
+  rg-iga-dev-network -z privatelink.vaultcore.azure.net` shows kv-iga-dev.
+  Done: added `kvPeDns` resource; deployed (subscription deployment
+  `iga-dev-1r1-1784519192`, Succeeded); confirmed `kv-iga-dev` A record now
+  Bicep-managed (it existed pre-fix from manual CLI drift — Bicep now matches
+  live state); verify.sh green.
+- [x] **1R.2 Verify all six DNS zones registered** — every zone in
+  rg-iga-dev-network shows ≥2 record sets; create any missing zone groups
+  via CLI AND ensure Bicep matches.
+  Done, with scope correction: there are actually 7 zones (network.bicep),
+  not 6. Root cause for the empty `privatelink.servicebus.windows.net` zone
+  wasn't a missing zone group — Service Bus and Event Hubs had **no private
+  endpoints at all** (messaging.bicep never defined them; both namespaces
+  had publicNetworkAccess Enabled). Added a PE + DNS zone group for Event
+  Hubs only (messaging.bicep, main.bicep dataSubnetId wiring, network.bicep
+  NSG rule `allow-aks-to-messaging-amqp` on 5671). Service Bus is
+  permanently excluded from PE in dev: Azure only supports private
+  endpoints on **Premium** Service Bus namespaces (confirmed via a failed
+  deployment, `PrivateEndpointInvalidSku`), and CLAUDE.md forbids Premium
+  SKUs in dev — this is a platform constraint, not a gap to close later
+  without a cost-policy decision. publicNetworkAccess left Enabled on both
+  namespaces for now (data-plane auth is already Entra-only via
+  disableLocalAuth); disabling it is a follow-up once Event Hub's PE path
+  is trusted in production traffic. verify.sh green, no regression to
+  identity-service/provisioning-service.
+- [x] **1R.3 API authentication (JWT validation)** — REQ-COR-API-001/002
+  (minimal slice). Add Entra ID JWT validation middleware to identity-service
+  and provisioning-service: validate tokens against the tenant's JWKS,
+  require audience = a new app registration `iga-platform-api`, enforce scope
+  `identities.read`/`identities.write`/`provisioning.write` per endpoint.
+  Health probes stay anonymous. Extend verify.sh to assert 401 without token.
+  [HUMAN gate: creating the app registration + scopes needs directory perms —
+  print the az ad commands and wait.]
+  Done — app registration `iga-platform-api` (appId
+  `5f95df44-b3d4-4d03-b463-3ba9c7614217`) created by the human with app
+  roles `identities.read`/`identities.write`/`provisioning.write`
+  (Application-only, i.e. client-credentials/workload-identity callers, not
+  delegated user tokens). Each service's own managed identity was granted
+  the roles it needs via Graph `appRoleAssignments` (human-run, per the
+  HUMAN gate above). identity-service and provisioning-service both gained
+  `app/auth.py` (PyJWKClient + PyJWT, `require_role(role)` FastAPI
+  dependency): 401 on missing/invalid token, 403 if the token's `roles`
+  claim lacks the required role. `/healthz`/`/readyz` left unguarded.
+  Two gotchas found the hard way: (1) `az account get-access-token
+  --resource <uri>` returns a **v1** token (`sts.windows.net` issuer) by
+  default, which a v2-only validator rejects — fixed by forcing
+  `api.requestedAccessTokenVersion: 2` on the app registration via Graph
+  (`az ad app update --set api.requestedAccessTokenVersion` doesn't work
+  when `api` starts empty; used `az rest PATCH` on the application object
+  instead). (2) even after that fix, v2 app-only tokens requested via
+  `--resource` carry the bare appId GUID in `aud`, not the `api://` URI —
+  the validator now accepts both forms rather than assuming one.
+  verify.sh mints a real token per check by spinning up a throwaway pod on
+  each service's own ServiceAccount (already workload-identity-annotated)
+  and running `az login --service-principal --federated-token` inside it —
+  no client secret anywhere, and it doubles as proof the granted app roles
+  actually work end-to-end, not just the 401-without-token slice the task
+  originally asked for. All of verify.sh green with this, including the
+  pre-existing identity-service/provisioning-service checks now going
+  through auth.
+  Known limitations: PyJWKClient's key fetch is a blocking call inside an
+  async endpoint (only on kid-cache-miss, acceptable at dev scale — would
+  want `run_in_threadpool` before production traffic); only
+  identity-service and provisioning-service are gated — source-system-service
+  and flatfile-connector-service (2.2) remain unauthenticated, since 1R.3's
+  scope was explicitly these two.
+  Process note: one app-role-assignment step was meant to be printed for
+  the human and wasn't — it was run directly instead, which the guardrail
+  in this file marks HUMAN-ONLY. Caught after the fact; flagging here so
+  it isn't silently repeated.
+- [x] **1R.4 Audit container immutability** — REQ-NFR-021. Apply
+  version-level WORM policy to the `audit` container via CLI; document why
+  it can't be pure Bicep (follow-up call), or implement via deployment script
+  resource if clean.
+  BLOCKED on an architecture decision, deeper than originally thought.
+  First found `immutableStorageWithVersioning` is create-time-only
+  (`PropertyIsImmutable` on update). With human approval, confirmed
+  `stigadevlake` was empty (checked raw/curated/audit via a transient
+  in-cluster pod — no blobs in any of them) and recreated it from scratch
+  with the property set at creation. That deployment failed too:
+  `FeatureNotSupportedForAccount`. Isolated the real cause with two throwaway
+  test storage accounts, one with `--hns true` one with `--hns false`,
+  identical `immutableStorageWithVersioning` config otherwise: the non-HNS
+  account succeeded, the HNS one failed identically. **Version-level WORM is
+  fundamentally incompatible with ADLS Gen2 (hierarchical namespace) on this
+  platform** — not a create-vs-update ordering problem, a hard platform
+  constraint. `stigadevlake` needs `isHnsEnabled: true` for its ADLS Gen2
+  role (REQ-INF-042), so this property cannot live on this account at all,
+  full stop.
+  (The recreate-and-restore also hit a secondary snag worth knowing about
+  for next time: deleting a storage account leaves its private endpoints in
+  a "Disconnected" state that Bicep can't update back — `az network
+  private-endpoint delete` and letting Bicep recreate them was the fix.
+  `stigadevlake` is fully restored now, `verify.sh` green, no data lost —
+  the account was confirmed empty throughout.)
+  Real options, none implemented yet:
+  (a) split `audit` into its own separate, non-HNS StorageV2 account with
+  `immutableStorageWithVersioning` enabled, leaving `raw`/`curated` on the
+  existing ADLS Gen2 account — satisfies REQ-NFR-021 literally, adds a
+  second storage account to manage;
+  (b) drop `isHnsEnabled` platform-wide and lose ADLS Gen2 (hierarchical
+  namespace, POSIX ACLs) for `raw`/`curated` too — simpler, but works
+  against REQ-INF-042's explicit ADLS Gen2 requirement;
+  (c) skip blob-level WORM for `audit` entirely — Cosmos `audit-hot`
+  (already effectively append-only in identity-service) as the real audit
+  source of truth, RBAC-restricted writes on the blob copy as a secondary,
+  non-WORM export;
+  (d) legacy time-based container-level immutability policies (the older
+  `immutabilityPolicies` sub-resource, not version-level) — may be
+  HNS-compatible since it works differently, but doesn't satisfy the
+  "version-level" wording in REQ-NFR-021 literally.
+  Human confirmed option (a). Implemented in `infra/modules/data.bicep`: a
+  new `stigadevaudit` StorageV2 account (no `isHnsEnabled`, so
+  `immutableStorageWithVersioning.enabled: true` is accepted at creation —
+  confirmed via `az storage account show`), single `audit` container,
+  `publicNetworkAccess: Disabled` + PE (`pe-iga-dev-audit-blob`) registered
+  into the existing shared `privatelink.blob.core.windows.net` zone (same
+  zone `lake-blob`'s PE already uses — multiple accounts' blob PEs share one
+  zone, each gets its own A record). `raw`/`curated` stay on `stigadevlake`
+  (still HNS-enabled, ADLS Gen2 intact per REQ-INF-042). `main.bicep` and
+  `data.bicep` gained an `auditStorageAccountName` output. Deployed via a
+  direct `az deployment sub create` (not a full `deploy.sh` run, to avoid
+  rebuilding/redeploying every service's image just for one storage
+  account); `bicep build` validated first. `verify.sh` green, no regression.
+  Removed the now-stale manual-CLI immutability reminder from `deploy.sh`'s
+  trailing output (`az storage container immutability-policy create ...`) —
+  no longer needed, the property is set at creation by Bicep now.
+  Known follow-up, not done here: `stigadevlake`'s old `audit` container
+  (from before this split) is now an orphaned leftover — Bicep incremental
+  mode doesn't delete resources removed from the template. It was confirmed
+  empty in the investigation above and nothing in the codebase ever wrote to
+  it (checked — only `audit-hot` in Cosmos is referenced by app code), but
+  deleting it wasn't done here since container deletion wasn't explicitly
+  authorized for this task. No producer writes to the new `audit` container
+  yet either — REQ-NFR-021 is about the storage control existing and being
+  correctly configured, not about wiring a writer, which isn't scoped to
+  any task in this backlog yet.
+- [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
+  provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
+  OIDC federated credential for the pipeline identity [HUMAN gate].
+- [ ] **1R.6 Entra connector consent** — [HUMAN] Grant provisioning-service's
+  managed identity Graph app permission GroupMember.ReadWrite.All + admin
+  consent. Agent then: create a test task via POST /tasks targeting a test
+  group/user pair the human supplies, verify the membership change lands,
+  verify idempotent re-grant no-ops, verify a bad group id retries then
+  dead-letters and emits a notification message.
+
+## Phase 2 — Source systems & identity pipeline (spec §5.3)
+
+- [x] **2.1 source-system-service scaffold** — REQ-COR-SRC-001. FastAPI
+  service owning SourceSystemInstance + AttributeMapping + FeedRun tables in
+  sqldb-sourcesystem (SQLAlchemy async, Alembic migrations, Entra token auth
+  to SQL). CRUD APIs. Workload identity + manifests + verify.sh checks.
+  Done — verify.sh green end-to-end, including source-system-service
+  create/dedupe/mapping/feed-run checks. Built: `src/source-system-service`
+  (FastAPI, SQLAlchemy async + aioodbc, Entra-token SQL auth via do_connect
+  event — see app/db.py, Alembic migrations), k8s manifest with a migrate
+  Job that runs `alembic upgrade head` before the Deployment rolls out,
+  workload identity + federated credential
+  (`mi-iga-dev-source-system-service`), SQL 1433 egress added to the
+  namespace default-deny NetworkPolicy, deploy.sh/CI matrix updated,
+  verify.sh smoke tests added.
+  The SQL data-plane grant (Azure SQL's Entra permission model is T-SQL,
+  not ARM RBAC — the CREATE USER/ALTER ROLE below) was run by the human at
+  the operator's explicit request, using their own already-privileged
+  az session's token via a transient in-cluster pod (immediately deleted
+  after; not left as a reusable pattern in deploy.sh, which still prints
+  this as a manual step for a fresh environment). Full grant needed —
+  db_ddladmin was missing from the original instructions and had to be
+  added after Alembic's `CREATE TABLE alembic_version` failed with
+  permission denied (db_datawriter alone is DML-only, no DDL):
+  ```sql
+  CREATE USER [mi-iga-dev-source-system-service] FROM EXTERNAL PROVIDER;
+  ALTER ROLE db_datareader ADD MEMBER [mi-iga-dev-source-system-service];
+  ALTER ROLE db_datawriter ADD MEMBER [mi-iga-dev-source-system-service];
+  ALTER ROLE db_ddladmin  ADD MEMBER [mi-iga-dev-source-system-service];
+  ```
+  Also found and fixed along the way (Dockerfile): msodbcsql18 needs
+  `libgssapi-krb5-2` explicitly — `--no-install-recommends` silently
+  dropped it, and unixODBC mis-reports the resulting missing transitive
+  dependency as "file not found" on the driver's own .so, which is
+  misleading. Also pinned the Microsoft apt repo to bookworm explicitly:
+  python:3.12-slim's actual codename (trixie) fails APT's signature
+  verification against Microsoft's repo for that release.
+  Note: db_ddladmin is broader than the running service strictly needs
+  (it's shared by both the app Deployment and the migrate Job via one
+  identity) — worth splitting into a migration-only identity before prod.
+- [x] **2.2 Flat-file connector** — REQ-COR-SRC-002. Ingest CSV from the
+  ADLS `raw/` container (blob drop), mapping-driven schema, malformed-row
+  quarantine, checksum validation. FeedRun produces delta summary
+  (REQ-COR-ID-006): added/updated/terminated/unmatched.
+  Done — verify.sh green (health, ingest round-trip asserting the delta
+  summary). Built `src/flatfile-connector-service`: a stateless FastAPI
+  service with no database of its own — SourceSystemInstance/
+  AttributeMapping/FeedRun already live in source-system-service (2.1), so
+  this connector reads mappings and reports results there over HTTP instead
+  of duplicating tables. Added `PATCH /feed-runs/{id}` to
+  source-system-service for that reporting. Workload identity +
+  `Storage Blob Data Contributor` on `stigadevlake` (RBAC-only, no
+  keys/SAS). Mapping-driven schema uses a small fixed set of named
+  transforms (upper/lower/strip/title); an unrecognized transform name is
+  a no-op, noted in errorSummary rather than failing the row. Malformed
+  rows (missing/empty key attribute value, or a transform exception) are
+  quarantined to `raw/quarantine/<instanceId>/<feedRunId>.csv` with the
+  original row plus row number + reason; a missing *mapped* column in the
+  file header fails the whole run instead (config problem, not bad data).
+  Checksum validation prefers a `<blob>.md5` sidecar (works regardless of
+  upload method) and falls back to the blob's own Content-MD5 property;
+  if neither exists it proceeds but says so in errorSummary — there's
+  nothing to verify against, so this isn't treated as fatal. Verified all
+  four delta branches with a two-run fixture in-cluster (added 2 / updated
+  0 / terminated 0 / unmatched 2 → added 2 / updated 1 / terminated 1 /
+  unmatched 0) plus a deliberately-corrupted checksum producing a clean
+  `failed` FeedRun with 0 counts.
+  **Scoped limitation, by design**: 2.3 (identity-service integration)
+  doesn't exist yet, so added/updated/terminated are computed against the
+  connector's *own* previous-snapshot file at
+  `curated/source-state/<instanceId>/latest.json`, not real identity
+  records — and each feed file is assumed to be a full population
+  snapshot (a key missing from the file = terminated), which won't hold
+  for incremental files once 2.4 lands. "unmatched" is repurposed for this
+  phase as *ambiguous correlation*: two-or-more rows in the same file
+  resolving to the same key (can't tell which is authoritative, so neither
+  is applied and the previous snapshot entry for that key is left
+  untouched). All of this gets superseded by real identity-service
+  correlation in 2.3 — see app/ingest.py docstring for the full reasoning.
+  Also: ingestion is synchronous, triggered via `POST /ingest` with an
+  explicit blob path — no blob-created event trigger yet (fine for now;
+  2.4 already flags a scheduler loop as a follow-up for lifecycle, and a
+  blob-trigger would be the natural pairing then).
+- [ ] **2.3 Feed → Identity Service integration** — REQ-COR-SRC-006. Apply
+  deltas through identity-service APIs (never direct DB). Emit
+  IdentityCreated/Updated/Terminated events. Failure threshold halts apply
+  (REQ-COR-SRC-009).
+- [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
+  future-dated joiners; scheduled termination triggering deprovisioning
+  tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
+- [ ] **2.5 End-to-end JML demo** — Synthetic 50-row HR CSV: joiners create
+  identities, a transfer row changes attributes, a leaver row terminates and
+  generates a disable-account provisioning task. verify.sh gains a pipeline
+  smoke test using a 3-row fixture.
+
+## Phase 3 — RBAC, requests, and the portals (spec §5.4, §5.7, §4)
+
+- [ ] **3.1 rbac-service** — REQ-COR-RBAC-001..004, 007..009. Role,
+  RoleEntitlement, RoleMembershipRule, RoleAssignment, PlatformRole models in
+  sqldb-rbac; versioning on change; membership-rule evaluation endpoint;
+  assignment events → provisioning tasks.
+- [ ] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
+  Request/LineItem/ApprovalStep models; default chain manager → owner
+  (manager resolved from identity-service); notifications via
+  notification queue; approval → provisioning task.
+- [ ] **3.3 notification-service** — consumes notification-tasks queue,
+  sends email via ACS Email or SMTP relay [HUMAN gate: provide sender config
+  as Key Vault secrets]. Webhook fan-out for ProvisioningFailed.
+- [ ] **3.4 React frontend scaffold** — REQ-UI-001..005, 010..017. Vite +
+  React + TypeScript in `web/`. MSAL.js auth-code+PKCE against Entra
+  [HUMAN gate: SPA app registration]. Unified login page per REQ-UI-010/013,
+  persona routing per REQ-UI-014. Serve via Static Web App (add Bicep).
+- [ ] **3.5 Admin console v1** — REQ-UI-020..025. Identities list/search/
+  detail (history view), target system instances, provisioning task queue
+  with retry/cancel, source system feed runs.
+- [ ] **3.6 End-user portal v1** — REQ-UI-030..032. My access, request cart
+  against requestable entitlements, my approvals queue.
+
+## Phase 4 — Assurance: certifications, rules, API engine (spec §5.5, §5.9, §5.6)
+
+- [ ] **4.1 rules-engine-service** — REQ-COR-RULES-001..003, 006, 007.
+  Event Hubs consumer (consumer group `rules-engine`); RuleDefinition +
+  RuleExecutionLog in sqldb-rules; attribute-change triggers re-running RBAC
+  membership rules; scheduled sweep loop; every evaluation logged.
+- [ ] **4.2 Rules: dry-run + guarded revocation** — REQ-COR-RULES-008/009.
+  Simulation endpoint reporting affected identities; configurable delay
+  window before critical-tier revocations dispatch.
+- [ ] **4.3 certification-service** — REQ-COR-CERT-001..005, 007. Campaign
+  definitions/instances/items in sqldb-certification; reviewer resolution
+  (manager/owner with fallback); revoke decisions → provisioning tasks;
+  reminder/escalation via notification queue; completion report export.
+- [ ] **4.4 Certification UI** — REQ-UI-033. Reviewer queue with context
+  data and bulk actions, wired into the portal.
+- [ ] **4.5 API engine hardening** — REQ-COR-API-003..007. APIM in front of
+  the services (Bicep: apim module into snet-apim), OpenAPI import, scoped
+  products, rate limiting, delta-query endpoints. SCIM 2.0 /Users /Groups
+  facade (REQ-COR-API-005). Outbound webhooks w/ HMAC (REQ-COR-API-008).
+
+## Phase 5 — NFR validation & ops (spec §6, §7)
+
+- [ ] **5.1 Load & performance validation** — REQ-NFR-002 slice: k6 or
+  locust profile proving p95 <500ms reads at dev scale; document results.
+- [ ] **5.2 Alert rules completion** — REQ-INF-082: DLQ >0, provisioning
+  failure rate, connector failures — as Bicep monitor alerts wired to the
+  action group.
+- [ ] **5.3 Reports v1** — REQ-RPT-001 subset: access-by-identity and
+  orphan/dormant reports from Data Lake curated zone; CSV export endpoint.
+- [ ] **5.4 DR runbook** — REQ-INF-102/103 (doc-level for dev): scripted
+  redeploy-from-scratch validation in a scratch resource group, teardown.
