@@ -27,7 +27,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from azure.identity.aio import DefaultAzureCredential
 from azure.servicebus.aio import ServiceBusClient
-from azure.servicebus import ServiceBusMessage
+from azure.servicebus import ServiceBusMessage, NEXT_AVAILABLE_SESSION
+from azure.servicebus.exceptions import OperationTimeoutError
 
 from .connectors import CONNECTOR_REGISTRY, ConnectorError
 from .auth import require_role
@@ -122,14 +123,13 @@ async def submit_task(task: ProvisioningTask):
 async def worker_loop() -> None:
     while True:
         try:
-            async with app.state.sb.get_queue_receiver(
-                TASK_QUEUE, max_wait_time=30
+            async with app.state.sb.get_queue_session_receiver(
+                TASK_QUEUE, session_id=NEXT_AVAILABLE_SESSION, max_wait_time=30
             ) as receiver:
-                # NOTE: for session queues use get_queue_session_receiver with
-                # NEXT_AVAILABLE_SESSION in azure-servicebus>=7.12; simplified
-                # here to keep the scaffold runnable against non-session dev queues.
                 async for msg in receiver:
                     await handle_message(receiver, msg)
+        except OperationTimeoutError:
+            continue  # normal — no session had a waiting message this cycle
         except asyncio.CancelledError:
             return
         except Exception:
