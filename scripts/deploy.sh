@@ -115,6 +115,10 @@ export FLATFILE_CONNECTOR_SVC_CLIENT_ID="${SVC_CLIENT_IDS[flatfile-connector-ser
 export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
 export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
 export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv)"
+# Job pod templates are immutable in Kubernetes, so a plain `kubectl apply`
+# fails once IMAGE_TAG changes (spec.template: field is immutable). Delete
+# any prior run before re-applying so the Job can be recreated cleanly.
+kubectl delete job/source-system-service-migrate -n iga --ignore-not-found
 for F in k8s/services/*.yaml; do
   envsubst < "$F" | kubectl apply -f -
 done
