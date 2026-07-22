@@ -150,12 +150,62 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
 - [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
   provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
   OIDC federated credential for the pipeline identity [HUMAN gate].
-- [ ] **1R.6 Entra connector consent** — [HUMAN] Grant provisioning-service's
+- [x] **1R.6 Entra connector consent** — [HUMAN] Grant provisioning-service's
   managed identity Graph app permission GroupMember.ReadWrite.All + admin
   consent. Agent then: create a test task via POST /tasks targeting a test
   group/user pair the human supplies, verify the membership change lands,
   verify idempotent re-grant no-ops, verify a bad group id retries then
   dead-letters and emits a notification message.
+  Done — Graph app role assignment granted to
+  `mi-iga-dev-provisioning-service`'s service principal
+  (`GroupMember.ReadWrite.All`, app role id `dbaae8cf-10b5-4b86-a4a1-f871c94c6695`),
+  verified via `GET .../appRoleAssignments`. All four sub-checks confirmed
+  with direct evidence, not log narration:
+  - Grant: real user/group pair submitted → `202` → processed →
+    `az ad group member check` returned `true`.
+  - Idempotent no-op: identical payload replayed → `202` → worker log
+    showed `entra grant: <user> already in <group> — no-op`, confirming a
+    verify-before-write skip, not a duplicate Graph call.
+  - Dead-letter: bogus all-zero `groupObjectId` → failed 5 times on the
+    1/5/30/120-minute backoff schedule → dead-lettered with
+    `deadLetterReason: max-attempts-exceeded` and the expected Graph 404
+    (`Request_ResourceNotFound`).
+  - Notification: matching `ProvisioningFailed` message confirmed on
+    `notification-tasks` — same `taskId`, same error, timestamp aligned
+    to the dead-letter event.
+  See 1R.7 — this task surfaced a real, unrelated worker bug that had to
+  be fixed before any of the above could be exercised at all.
+
+- [x] **1R.7 provisioning-service worker: dead session-queue receiver**
+  (discovered during 1R.6 testing, not originally scoped) — the worker's
+  `get_queue_receiver()` call omitted `session_id=NEXT_AVAILABLE_SESSION`
+  even though `provisioning-tasks` was provisioned with
+  `requiresSession: true` and every sender already tagged messages with a
+  session id. A non-session receiver against a session-required queue
+  never raises — it just polls forever with zero messages delivered. Net
+  effect: the worker had never successfully processed a single task since
+  it was built, for any connector, not just Entra — masked because
+  `healthz`/`readyz` don't touch the worker loop, so pods stayed "healthy"
+  throughout, and an always-empty DLQ looked like success rather than
+  "nothing has ever actually run."
+  Fix: `get_queue_receiver(TASK_QUEUE, session_id=NEXT_AVAILABLE_SESSION,
+  max_wait_time=30)`, catching `OperationTimeoutError` as the normal
+  empty-poll case.
+  Two gotchas worth carrying forward: (1) the first fix attempt used
+  `get_queue_session_receiver`, a method that doesn't exist on
+  `ServiceBusClient` in azure-servicebus 7.12 — caught before it caused a
+  second silent failure, but it briefly reached a live redeploy (worker
+  crash-looped on `AttributeError` for a few minutes — same net effect as
+  before, not worse). (2) Fixing this surfaced a second, unrelated
+  `deploy.sh` bug: `kubectl apply` on `source-system-service-migrate`'s Job
+  failed with "field is immutable" once its image tag changed — Jobs don't
+  support in-place template updates. Fixed durably in `deploy.sh`: delete
+  the stale Job (`--ignore-not-found`) before every re-apply.
+  Once genuinely fixed, the worker correctly drained its entire backlog —
+  including several hours' worth of stuck `ad`-connector tasks from
+  repeated `verify.sh` runs, all correctly failing with "invalid server
+  address" since AD bind credentials were never wired into Key Vault, a
+  separately known, already-tracked gap.
 
 ## Phase 2 — Source systems & identity pipeline (spec §5.3)
 
