@@ -30,6 +30,9 @@ spec:
           env:
             - { name: STORAGE_ACCOUNT_NAME, value: "${LAKE_STORAGE_ACCOUNT}" }
             - { name: SOURCE_SYSTEM_SERVICE_URL, value: "http://source-system-service" }
+            - { name: IDENTITY_SERVICE_URL, value: "http://identity-service" }
+            - { name: PROVISIONING_SERVICE_URL, value: "http://provisioning-service" }
+            - { name: API_AUDIENCE, value: "${API_AUDIENCE}" }
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 10
