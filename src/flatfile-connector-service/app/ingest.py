@@ -1,24 +1,67 @@
 """
-Flat-file connector core (REQ-COR-SRC-002, REQ-COR-ID-006).
+Flat-file connector core (REQ-COR-SRC-002, REQ-COR-ID-006, REQ-COR-SRC-006/009).
 
 Stateless connector: it owns no database of its own. SourceSystemInstance,
 AttributeMapping, and FeedRun all live in source-system-service (2.1) — this
 connector reads mappings and reports results there over HTTP.
 
-Delta semantics (added/updated/terminated/unmatched), scoped to 2.2:
-there is no identity-service integration yet (that's 2.3), so "added" /
-"updated" / "terminated" are computed against this connector's OWN previous
-snapshot of the file, stored at
-`curated/source-state/<instanceId>/latest.json` (keyed by correlation key,
-valued by a content hash of the mapped attributes) — not against real
-identity records. Each feed file is assumed to be a full snapshot of the
-source population (common for HR flat-file extracts): a correlation key
-present in the previous snapshot but absent from the current file is
-"terminated". "unmatched" is repurposed for 2.2 as *ambiguous correlation
-within a single file*: two or more rows resolving to the same correlation
-key, which cannot be safely applied as added/updated without knowing which
-is authoritative. True "does this correlate to a known identity" unmatched
-semantics arrive with 2.3. See roadmap/PHASES.md 2.2 note.
+Delta semantics (added/updated/terminated/unmatched), as of 2.3: each unique
+correlation key in the file is resolved against identity-service itself
+(GET /identities/by-correlation-key/{key}) — a 404 means "create", a 200
+means "diff and PATCH only the changed attributes". Identity data and the
+add/update decision both come from identity-service now, not from a local
+snapshot. "unmatched" is unchanged from 2.2: *ambiguous correlation within a
+single file* (two-or-more rows resolving to the same key) — such rows are
+never applied and the previous known-keys entry for that key, if any, is
+left untouched.
+
+Termination detection is the one thing identity-service alone can't answer:
+iterating this run's rows can only ever see keys present *now* — it cannot
+discover a key that's now *absent*. There is no bulk "list identities for
+this source system" query, so this connector still keeps a minimal local
+state at `curated/source-state/<instanceId>/latest.json` — but as of 2.3 it
+is just the *set* of correlation keys seen as of the last completed run, no
+longer a content-hash snapshot (see `_load_known_keys`/`_save_known_keys`).
+A key that was known and is absent from the current file gets its identity
+PATCHed to status=terminated, and — for each entry in that source system
+instance's `provisioningTargets` — a disable-account task is POSTed to
+provisioning-service. An empty `provisioningTargets` is a valid, safe
+default (nothing dispatched, just logged), not an error condition.
+
+Known, deliberately out-of-scope gap: there is no target-system-instance
+registry or account-identifier mapping (userDn/userObjectId) anywhere in the
+current data model, so a disable-account task's `payload` cannot carry a
+real target-system identifier — it's best-effort (`correlationKey` only) for
+traceability. `instanceId` on the task reuses the *source* instance id, since
+no separate target-instance registry exists. Real execution of these tasks
+already has known gaps tracked elsewhere (AD bind creds never wired per
+1R.7; EntraIdConnector has no disable_account handler at all) — 2.3 is
+scoped to emitting the correct task at the correct trigger point, not to
+closing those connector-side gaps.
+
+Failure-threshold halt (REQ-COR-SRC-009, paraphrased): only identity-service/
+provisioning-service apply failures (5xx, timeouts/connection errors on the
+GET/POST/PATCH calls below) count toward `APPLY_FAILURE_THRESHOLD` — 2.2's
+malformed-row quarantine is a separate, already-handled concern and never
+counts here. Crossing the threshold stops processing remaining rows in this
+run (no more identity-service/provisioning-service calls) but does NOT roll
+back rows already applied — there's no compensation/saga mechanism here.
+The known-keys snapshot is saved reflecting exactly what was durably applied
+before the halt, so the next run resumes correctly. The FeedRun is marked
+`failed` with attempted/succeeded/apply-failure counts folded into
+`errorSummary` (no new FeedRun columns were added for this — it reuses the
+existing free-text field, same as the other operational notes below).
+
+Auth: identity-service and provisioning-service both validate a bearer token
+against the `iga-platform-api` app registration (REQ-COR-API-001/002, Phase
+1R.3) and require a specific app role per endpoint. This connector acquires
+one token per run via its own workload identity (`API_AUDIENCE` env var,
+same audience as 1R.3) and attaches it to every identity-service/
+provisioning-service call. Its managed identity must be granted the
+`identities.read`, `identities.write`, and `provisioning.write` app roles —
+a [HUMAN] gate (Graph app-role-assignment needs directory perms), printed by
+deploy.sh, same pattern as 1R.3/1R.6. Without that grant, every call below
+will 403 and (correctly) count toward the apply-failure threshold above.
 
 Malformed rows (missing/empty key attribute, or a value that can't survive
 its transform) are quarantined rather than failing the whole run. A missing
@@ -34,6 +77,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 from azure.core.exceptions import ResourceNotFoundError
@@ -46,6 +90,10 @@ STORAGE_ACCOUNT = os.environ.get("STORAGE_ACCOUNT_NAME", "")
 RAW_CONTAINER = "raw"
 CURATED_CONTAINER = "curated"
 SOURCE_SYSTEM_SERVICE_URL = os.environ.get("SOURCE_SYSTEM_SERVICE_URL", "http://source-system-service")
+IDENTITY_SERVICE_URL = os.environ.get("IDENTITY_SERVICE_URL", "http://identity-service")
+PROVISIONING_SERVICE_URL = os.environ.get("PROVISIONING_SERVICE_URL", "http://provisioning-service")
+API_AUDIENCE = os.environ.get("API_AUDIENCE", "")  # e.g. api://<iga-platform-api appId> — same as 1R.3
+APPLY_FAILURE_THRESHOLD = int(os.environ.get("APPLY_FAILURE_THRESHOLD", "5"))  # REQ-COR-SRC-009
 
 # Small, fixed set of named transforms (REQ-COR-SRC-002 "mapping-driven
 # schema" — kept intentionally minimal for 2.2; an unrecognized transform
@@ -65,10 +113,6 @@ class IngestError(Exception):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _content_hash(target: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(target, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 async def _verify_checksum(container_client, blob_path: str, content: bytes) -> Optional[str]:
@@ -116,7 +160,21 @@ async def run_ingestion(instance_id: str, blob_path: str, triggered_by: str = "m
     credential = DefaultAzureCredential()
     feed_run_id: Optional[str] = None
     try:
-        async with httpx.AsyncClient(base_url=SOURCE_SYSTEM_SERVICE_URL, timeout=30.0) as http:
+        if not API_AUDIENCE:
+            raise IngestError("API_AUDIENCE not configured; cannot authenticate to identity-service/provisioning-service")
+        token = (await credential.get_token(f"{API_AUDIENCE}/.default")).token
+        auth_headers = {"Authorization": f"Bearer {token}"}
+
+        async with httpx.AsyncClient(base_url=SOURCE_SYSTEM_SERVICE_URL, timeout=30.0) as http, \
+                httpx.AsyncClient(base_url=IDENTITY_SERVICE_URL, timeout=30.0, headers=auth_headers) as identity_http, \
+                httpx.AsyncClient(base_url=PROVISIONING_SERVICE_URL, timeout=30.0, headers=auth_headers) as provisioning_http:
+
+            instance_resp = await http.get(f"/source-systems/{instance_id}")
+            if instance_resp.status_code == 404:
+                raise IngestError(f"source system instance {instance_id} not found")
+            instance_resp.raise_for_status()
+            provisioning_targets = instance_resp.json().get("provisioningTargets", [])
+
             mappings_resp = await http.get(f"/source-systems/{instance_id}/mappings")
             if mappings_resp.status_code == 404:
                 raise IngestError(f"source system instance {instance_id} not found")
@@ -131,7 +189,10 @@ async def run_ingestion(instance_id: str, blob_path: str, triggered_by: str = "m
             run_resp.raise_for_status()
             feed_run_id = run_resp.json()["id"]
 
-            summary = await _process(credential, http, instance_id, feed_run_id, blob_path, mappings)
+            summary = await _process(
+                credential, http, identity_http, provisioning_http,
+                instance_id, feed_run_id, blob_path, mappings, provisioning_targets,
+            )
             return summary
     except IngestError as e:
         if feed_run_id:
@@ -146,8 +207,182 @@ async def run_ingestion(instance_id: str, blob_path: str, triggered_by: str = "m
         await credential.close()
 
 
+async def _call(coro) -> tuple[Optional[httpx.Response], Optional[str]]:
+    """Run a single identity-service/provisioning-service apply call.
+    Returns (response, None) on a completed round-trip — caller checks
+    status_code — or (None, reason) on a network-level failure (timeout,
+    connection error). Both branches count toward the apply-failure
+    threshold (REQ-COR-SRC-009) the same way."""
+    try:
+        resp = await coro
+        return resp, None
+    except httpx.RequestError as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def _apply_added_updated(
+    identity_http: httpx.AsyncClient, instance_id: str, unique_rows: dict[str, dict[str, Any]], threshold: int
+) -> dict[str, Any]:
+    """Add/update pass (REQ-COR-SRC-006): resolve each row's correlation key
+    against identity-service and create-or-patch accordingly. Halts once
+    `threshold` apply failures accumulate (REQ-COR-SRC-009); does not roll
+    back rows already applied."""
+    added = updated = succeeded = attempted = failed = 0
+    applied_keys: set[str] = set()
+    halted = False
+    halt_reason: Optional[str] = None
+
+    for key, target in unique_rows.items():
+        attempted += 1
+        resp, err = await _call(identity_http.get(f"/identities/by-correlation-key/{quote(key, safe='')}"))
+        if err or resp.status_code not in (200, 404):
+            failed += 1
+            if failed >= threshold:
+                halted, halt_reason = True, err or f"GET by-correlation-key returned {resp.status_code} for '{key}'"
+                break
+            continue
+
+        if resp.status_code == 404:
+            body = {**target, "correlationKey": key, "sourceSystemId": instance_id}
+            resp2, err2 = await _call(identity_http.post("/identities", json=body))
+            if err2 or resp2.status_code != 201:
+                failed += 1
+                if failed >= threshold:
+                    halted, halt_reason = True, err2 or f"POST /identities returned {resp2.status_code} for '{key}'"
+                    break
+                continue
+            added += 1
+            succeeded += 1
+            applied_keys.add(key)
+            continue
+
+        existing = resp.json()
+        applied_keys.add(key)  # confirmed to exist regardless of whether an update follows
+        changed = {k: v for k, v in target.items() if existing.get(k) != v}
+        if not changed:
+            succeeded += 1
+            continue
+        resp3, err3 = await _call(identity_http.patch(f"/identities/{existing['identityId']}", json=changed))
+        if err3 or resp3.status_code != 200:
+            failed += 1
+            if failed >= threshold:
+                halted, halt_reason = True, err3 or f"PATCH /identities/{existing['identityId']} returned {resp3.status_code}"
+                break
+            continue
+        updated += 1
+        succeeded += 1
+
+    return {
+        "added": added, "updated": updated, "succeeded": succeeded, "attempted": attempted, "failed": failed,
+        "halted": halted, "halt_reason": halt_reason, "applied_keys": applied_keys,
+    }
+
+
+async def _apply_terminations(
+    identity_http: httpx.AsyncClient,
+    provisioning_http: httpx.AsyncClient,
+    instance_id: str,
+    feed_run_id: str,
+    provisioning_targets: list[str],
+    terminated_keys: set[str],
+    threshold: int,
+    failed_so_far: int,
+) -> dict[str, Any]:
+    """Termination pass: a key known as of the last run but absent from this
+    one gets its identity PATCHed to status=terminated, then a
+    disable-account task is dispatched to each of the source instance's
+    provisioningTargets (none configured -> logged, not an error)."""
+    terminated = succeeded = attempted = 0
+    failed = failed_so_far
+    halted = False
+    halt_reason: Optional[str] = None
+    removed_keys: set[str] = set()
+
+    for key in terminated_keys:
+        attempted += 1
+        resp, err = await _call(identity_http.get(f"/identities/by-correlation-key/{quote(key, safe='')}"))
+        if err or resp.status_code not in (200, 404):
+            failed += 1
+            if failed >= threshold:
+                halted, halt_reason = True, err or f"GET by-correlation-key returned {resp.status_code} for '{key}'"
+                break
+            continue
+
+        if resp.status_code == 404:
+            # Locally known as previously seen, but identity-service has no
+            # record of it (e.g. a prior run's create never actually
+            # landed) — nothing to terminate; stop tracking it as active.
+            log.warning("terminated-key '%s' has no identity-service record; dropping from known-keys", key)
+            removed_keys.add(key)
+            succeeded += 1
+            continue
+
+        existing = resp.json()
+        if existing.get("status") == "terminated":
+            removed_keys.add(key)  # already terminated — stop tracking it as active
+            succeeded += 1
+            continue
+
+        resp2, err2 = await _call(
+            identity_http.patch(f"/identities/{existing['identityId']}", json={"status": "terminated"})
+        )
+        if err2 or resp2.status_code != 200:
+            failed += 1
+            if failed >= threshold:
+                halted, halt_reason = True, err2 or f"PATCH /identities/{existing['identityId']} (terminate) returned {resp2.status_code}"
+                break
+            continue
+
+        terminated += 1
+        removed_keys.add(key)
+
+        if not provisioning_targets:
+            log.info(
+                "identity %s terminated; source instance %s has no provisioningTargets configured — "
+                "no disable-account tasks dispatched", existing["identityId"], instance_id,
+            )
+            succeeded += 1
+            continue
+
+        dispatch_failed = False
+        for connector_type in provisioning_targets:
+            task_body = {
+                "sourceType": "source-feed",
+                "sourceRef": feed_run_id,
+                "identityId": existing["identityId"],
+                "instanceId": instance_id,
+                "connectorType": connector_type,
+                "operationType": "disable-account",
+                "payload": {"correlationKey": key},
+            }
+            resp3, err3 = await _call(provisioning_http.post("/tasks", json=task_body))
+            if err3 or resp3.status_code != 202:
+                failed += 1
+                dispatch_failed = True
+                if failed >= threshold:
+                    halted, halt_reason = True, err3 or f"POST /tasks (disable-account, {connector_type}) returned {resp3.status_code}"
+                    break
+        if not dispatch_failed:
+            succeeded += 1
+        if halted:
+            break
+
+    return {
+        "terminated": terminated, "succeeded": succeeded, "attempted": attempted, "failed": failed,
+        "halted": halted, "halt_reason": halt_reason, "removed_keys": removed_keys,
+    }
+
+
 async def _process(
-    credential, http: httpx.AsyncClient, instance_id: str, feed_run_id: str, blob_path: str, mappings: list[dict]
+    credential,
+    http: httpx.AsyncClient,
+    identity_http: httpx.AsyncClient,
+    provisioning_http: httpx.AsyncClient,
+    instance_id: str,
+    feed_run_id: str,
+    blob_path: str,
+    mappings: list[dict],
+    provisioning_targets: list[str],
 ) -> dict[str, Any]:
     async with BlobServiceClient(
         account_url=f"https://{STORAGE_ACCOUNT}.blob.core.windows.net", credential=credential
@@ -212,24 +447,31 @@ async def _process(
         unmatched_count = sum(len(v) for v in duplicate_keys.values())
         unique_rows = {k: v[0][1] for k, v in rows_by_key.items() if len(v) == 1}
 
-        previous_snapshot = await _load_snapshot(curated_container, instance_id)
+        previous_keys = await _load_known_keys(curated_container, instance_id)
 
-        added = updated = 0
-        new_snapshot = dict(previous_snapshot)
-        for key, target in unique_rows.items():
-            content_hash = _content_hash(target)
-            if key not in previous_snapshot:
-                added += 1
-            elif previous_snapshot[key] != content_hash:
-                updated += 1
-            new_snapshot[key] = content_hash
+        apply = await _apply_added_updated(identity_http, instance_id, unique_rows, APPLY_FAILURE_THRESHOLD)
+        known_keys = set(previous_keys) | apply["applied_keys"]
 
-        terminated_keys = set(previous_snapshot) - set(unique_rows) - set(duplicate_keys)
-        for key in terminated_keys:
-            del new_snapshot[key]
-        terminated = len(terminated_keys)
+        terminated = term_succeeded = term_attempted = 0
+        apply_failed = apply["failed"]
+        halted, halt_reason = apply["halted"], apply["halt_reason"]
 
-        await _save_snapshot(curated_container, instance_id, new_snapshot)
+        if not halted:
+            terminated_keys = set(previous_keys) - set(unique_rows) - set(duplicate_keys)
+            term = await _apply_terminations(
+                identity_http, provisioning_http, instance_id, feed_run_id,
+                provisioning_targets, terminated_keys, APPLY_FAILURE_THRESHOLD, apply_failed,
+            )
+            terminated = term["terminated"]
+            term_succeeded = term["succeeded"]
+            term_attempted = term["attempted"]
+            apply_failed = term["failed"]
+            halted, halt_reason = term["halted"], term["halt_reason"]
+            known_keys -= term["removed_keys"]
+
+        # Persist exactly what was durably applied, halted or not — no
+        # rollback, so the next run resumes from real state (REQ-COR-SRC-009).
+        await _save_known_keys(curated_container, instance_id, known_keys)
 
         quarantine_path = None
         if quarantined:
@@ -248,13 +490,23 @@ async def _process(
         if quarantine_path:
             notes.append(f"{len(quarantined)} row(s) quarantined at {RAW_CONTAINER}/{quarantine_path}")
 
-        status = "partial" if quarantined else "succeeded"
+        total_attempted = apply["attempted"] + term_attempted
+        total_succeeded = apply["succeeded"] + term_succeeded
+        apply_note = (
+            f"identity-service/provisioning-service apply: {total_attempted} row(s) attempted, "
+            f"{total_succeeded} succeeded, {apply_failed} apply failure(s)"
+        )
+        if halted:
+            apply_note += f" — HALTED (REQ-COR-SRC-009): {halt_reason}; remaining rows in this run were not processed"
+        notes.append(apply_note)
+
+        status = "failed" if halted else ("partial" if quarantined else "succeeded")
         summary = {
             "status": status,
             "completedAt": _now().isoformat(),
             "recordsProcessed": records_processed,
-            "recordsAdded": added,
-            "recordsUpdated": updated,
+            "recordsAdded": apply["added"],
+            "recordsUpdated": apply["updated"],
             "recordsTerminated": terminated,
             "recordsUnmatched": unmatched_count,
             "recordsQuarantined": len(quarantined),
@@ -265,19 +517,26 @@ async def _process(
         return summary
 
 
-async def _load_snapshot(curated_container, instance_id: str) -> dict[str, str]:
+async def _load_known_keys(curated_container, instance_id: str) -> set[str]:
+    """Correlation keys this connector believes are currently active for
+    this source, as of the last completed run — used solely to detect
+    terminations (a key that was known and is now absent from the file).
+    Add/update decisions and identity data come from identity-service
+    itself (2.3); this is deliberately not a content snapshot any more."""
     try:
         client = curated_container.get_blob_client(f"source-state/{instance_id}/latest.json")
         downloader = await client.download_blob()
         raw = await downloader.readall()
-        return json.loads(raw)
+        return set(json.loads(raw)["correlationKeys"])
     except ResourceNotFoundError:
-        return {}
+        return set()
 
 
-async def _save_snapshot(curated_container, instance_id: str, snapshot: dict[str, str]) -> None:
+async def _save_known_keys(curated_container, instance_id: str, known_keys: set[str]) -> None:
     client = curated_container.get_blob_client(f"source-state/{instance_id}/latest.json")
-    await client.upload_blob(json.dumps(snapshot, sort_keys=True).encode("utf-8"), overwrite=True)
+    await client.upload_blob(
+        json.dumps({"correlationKeys": sorted(known_keys)}).encode("utf-8"), overwrite=True
+    )
 
 
 async def _write_quarantine(raw_container, path: str, rows: list[tuple[int, dict, str]]) -> None:

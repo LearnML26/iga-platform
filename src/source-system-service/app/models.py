@@ -28,6 +28,12 @@ class SourceSystemInstance(Base):
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active | inactive
     config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Connector instance IDs (target systems) that should receive a
+    # disable-account provisioning task when this source marks an identity
+    # terminated (2.3 termination -> provisioning-task trigger). Empty by
+    # default: an instance must opt in explicitly, nothing is wired
+    # automatically off connectorType.
+    provisioningTargets: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     createdDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     lastModifiedDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 

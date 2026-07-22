@@ -194,6 +194,28 @@ async def create_identity(body: IdentityIn):
     return doc
 
 
+@app.get(
+    "/identities/by-correlation-key/{correlation_key}",
+    response_model=Identity,
+    dependencies=[require_role("identities.read")],
+)
+async def get_identity_by_correlation_key(correlation_key: str):
+    """Dedicated correlation-key lookup (REQ-COR-ID-002), used by source
+    connectors (2.3) to resolve a feed row to an existing identity without
+    a full search query. Registered ahead of /{identity_id} so the literal
+    'by-correlation-key' segment isn't swallowed as a path param."""
+    existing = [
+        item async for item in app.state.identities.query_items(
+            query="SELECT * FROM c WHERE c.correlationKey = @k AND c.tenantId = @t",
+            parameters=[{"name": "@k", "value": correlation_key},
+                        {"name": "@t", "value": TENANT_ID}],
+        )
+    ]
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"no identity correlated to key '{correlation_key}'")
+    return existing[0]
+
+
 @app.get("/identities/{identity_id}", response_model=Identity, dependencies=[require_role("identities.read")])
 async def get_identity(identity_id: str):
     try:

@@ -298,10 +298,76 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   explicit blob path — no blob-created event trigger yet (fine for now;
   2.4 already flags a scheduler loop as a follow-up for lifecycle, and a
   blob-trigger would be the natural pairing then).
-- [ ] **2.3 Feed → Identity Service integration** — REQ-COR-SRC-006. Apply
+- [x] **2.3 Feed → Identity Service integration** — REQ-COR-SRC-006. Apply
   deltas through identity-service APIs (never direct DB). Emit
   IdentityCreated/Updated/Terminated events. Failure threshold halts apply
   (REQ-COR-SRC-009).
+  DONE (scaffold, unverified in a live cluster — branch only, pending
+  review/deploy): replaced 2.2's local content-hash snapshot with real
+  identity-service calls per row, keyed on the existing correlation_key.
+  Two small additions first: `GET /identities/by-correlation-key/{key}` on
+  identity-service (404 → not found), and `provisioningTargets: list[str]`
+  on SourceSystemInstanceIn/SourceSystemInstance (+ Alembic migration
+  0002 — the ORM column was required, not optional: create_source_system
+  does `SourceSystemInstance(**body.model_dump())`, so a Pydantic-only
+  field addition would TypeError on every create).
+  Per-row logic in ingest.py: 404 + row present → POST /identities
+  (create); found + row present → PATCH with only the changed attributes
+  (identity-service's existing no-op-on-unchanged-fields in
+  update_identity() double-checked directly, not assumed). Termination
+  needed a design decision: iterating this run's file can only ever see
+  keys present now, never keys now absent, and identity-service has no
+  bulk "list by sourceSystemId" query — so `curated/source-state/
+  <instanceId>/latest.json` is kept, but narrowed to just the *set* of
+  correlation keys seen last run (no more content hash), used solely to
+  compute the terminated set. A newly-terminated identity gets PATCHed to
+  status=terminated, then a disable-account task is POSTed to
+  provisioning-service for each entry in its source instance's
+  provisioningTargets (empty list → logged, not an error — the safe
+  default for unconfigured sources).
+  Failure-threshold halt (REQ-COR-SRC-009): only identity-service/
+  provisioning-service apply failures (5xx, timeouts/connection errors)
+  count toward `APPLY_FAILURE_THRESHOLD` (new env var, default 5, mirrors
+  provisioning-service's MAX_ATTEMPTS pattern) — 2.2's malformed-row
+  quarantine stays a separate, uncounted concern. Crossing it stops the
+  run (no more rows processed) without rolling back rows already applied
+  (no compensation/saga mechanism exists); the known-keys snapshot is
+  saved reflecting exactly what was durably applied before the halt, so
+  the next run resumes correctly. No new FeedRun columns were added for
+  attempted/succeeded/failed counts — they're folded into the existing
+  free-text errorSummary alongside the pre-existing checksum/transform/
+  quarantine notes.
+  Auth gap found and closed: identity-service and provisioning-service
+  both require a validated `iga-platform-api` bearer token per request
+  (1R.3), but flatfile-connector-service previously only called the
+  unauthenticated source-system-service. Added one-token-per-run
+  acquisition via the connector's own workload identity (same
+  API_AUDIENCE audience as 1R.3), attached to every identity-service/
+  provisioning-service call. New env vars (IDENTITY_SERVICE_URL,
+  PROVISIONING_SERVICE_URL, API_AUDIENCE) wired into
+  k8s/services/flatfile-connector-service.yaml — no NetworkPolicy change
+  needed, `allow-intra-namespace-app` already permits pod-to-pod on 8080.
+  [HUMAN gate, printed in deploy.sh]: flatfile-connector-service's managed
+  identity needs identities.read/identities.write/provisioning.write
+  granted via Graph appRoleAssignments, same pattern as 1R.3/1R.6 — until
+  granted, every call 403s, which correctly counts toward the threshold
+  above rather than hanging.
+  Known, deliberately unresolved gaps (flagged, not fixed here): (1) no
+  target-system-instance registry or account-identifier mapping
+  (userDn/userObjectId) exists anywhere in the data model, so a
+  disable-account task's payload can't carry a real target identifier
+  (best-effort `correlationKey` only) and `instanceId` on the task reuses
+  the *source* instance id for lack of a separate target registry; (2)
+  EntraIdConnector still has no disable_account handler at all (only
+  ActiveDirectoryConnector does) — a provisioningTargets entry of "entra"
+  will retry-and-dead-letter, a pre-existing gap, not introduced here;
+  (3) IdentityCreated/Updated/Terminated events were already emitted by
+  identity-service itself before this task (publish_event in
+  create_identity/update_identity) — 2.3 triggers those paths via HTTP,
+  it doesn't add new event-emission code.
+  Not run: ruff clean and both changed files compile, but no verify.sh /
+  in-cluster smoke test — deploy.sh wasn't run per this task's scope
+  (branch only, for review).
 - [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
