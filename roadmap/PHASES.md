@@ -383,6 +383,27 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   for every identity. Fixed by adding `model_config =
   ConfigDict(extra="allow")` to IdentityIn so create matches update's
   existing behavior (see fix/identity-extra-fields-allow branch/PR).
+  Re-ran the full 3-round smoke test after that fix deployed, this time
+  with correlation keys never used before (E2001-E2004, to rule out any
+  contamination from the earlier buggy run's leftover data). Every delta
+  count matched exactly: round 1 3/0/0 (added/updated/terminated), round 2
+  1/1/1, round 3 0/0/1. Round 2's `recordsUpdated:1` (not the old buggy
+  `2`) is the direct confirmation — a genuinely-unchanged identity now
+  correctly produces zero updates.
+  One separate, unresolved item, not blocking: the smoke test's own
+  direct `GET /identities/by-correlation-key/{key}` checks (used only to
+  independently verify status, not part of the application's own
+  add/update/terminate path) returned empty/no-response on every single
+  attempt across 3 full runs, while flatfile-connector-service's internal
+  calls to the same identity-service endpoint succeeded every time in the
+  same runs. Since a real permission problem would surface as a 403 with
+  a body rather than total silence, current best guess is a hang tied to
+  PyJWKClient's known blocking JWKS fetch on a cold per-replica cache
+  (flagged as a limitation in 1R.3) combined with curl having no
+  `--max-time` in the test harness — but this is unconfirmed, and worth
+  a closer look if it recurs. Doesn't affect the conclusion above: the
+  delta-summary numbers come from the application's own internal calls,
+  which is the authoritative evidence and was consistently correct.
 - [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
