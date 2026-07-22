@@ -13,6 +13,12 @@
 # instance's *current* provisioningTargets — a target removed from config
 # is still retried until it succeeds, exercised below via the mid-test
 # PATCH in step 6.
+#
+# Uses a fresh, run-unique source system name AND correlationKey every
+# time (correlationKey is global per tenant and identity-service has no
+# DELETE endpoint — reusing a fixed employee ID across runs silently
+# picks up leftover state from a prior attempt and produces confusing,
+# contaminated results).
 # ============================================================================
 set -uo pipefail
 FAIL=0
@@ -21,6 +27,10 @@ bad()  { echo "  ✘ $1"; FAIL=1; }
 
 NS=iga
 STORAGE_ACCOUNT=stigadevlake
+RUN_ID=$(date +%s)
+SRC_NAME="dispatch-retry-verify-${RUN_ID}"
+EMP_ID="E${RUN_ID}"
+echo "Run ID: $RUN_ID (source system: $SRC_NAME, employee: $EMP_ID)"
 
 run_curl() {
   local name="$1"; shift
@@ -82,8 +92,8 @@ echo ""
 echo "== 1. Fresh source system, two real provisioning targets =="
 OUT=$(run_curl drv-src-create -X POST http://source-system-service/source-systems \
   -H 'Content-Type: application/json' \
-  -d '{"name":"dispatch-retry-verify","connectorType":"flat-file","provisioningTargets":["ad","entra"]}')
-if echo "$OUT" | grep -q 'HTTP_STATUS:201'; then ok "source system 'dispatch-retry-verify' created"; else
+  -d "{\"name\":\"${SRC_NAME}\",\"connectorType\":\"flat-file\",\"provisioningTargets\":[\"ad\",\"entra\"]}")
+if echo "$OUT" | grep -q 'HTTP_STATUS:201'; then ok "source system '$SRC_NAME' created"; else
   bad "source system create failed: $OUT"; exit 1
 fi
 SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -97,28 +107,28 @@ run_curl drv-mapping-2 -X POST "http://source-system-service/source-systems/${SR
   -d '{"sourceAttribute":"DisplayName","targetAttribute":"displayName","isKey":false}' > /dev/null
 
 echo ""
-echo "== 2. Create E9001 =="
-upload_csv 'EmployeeID,DisplayName
-E9001,Retry Test User' "dispatch-retry-verify/a.csv"
+echo "== 2. Create $EMP_ID =="
+upload_csv "EmployeeID,DisplayName
+${EMP_ID},Retry Test User" "${SRC_NAME}/a.csv"
 OUT=$(run_curl drv-ingest-a -X POST http://flatfile-connector-service/ingest \
   -H 'Content-Type: application/json' \
-  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"dispatch-retry-verify/a.csv\",\"triggeredBy\":\"drv-a\"}")
+  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"${SRC_NAME}/a.csv\",\"triggeredBy\":\"drv-a\"}")
 echo "    ingest response: $OUT"
-echo "$OUT" | grep -q '"recordsAdded":1' && ok "E9001 created" || bad "E9001 create failed: $OUT"
+echo "$OUT" | grep -q '"recordsAdded":1' && ok "$EMP_ID created" || bad "$EMP_ID create failed: $OUT"
 
 echo ""
-echo "== 3. Break provisioning-service, terminate E9001 (both dispatches should fail) =="
+echo "== 3. Break provisioning-service, terminate $EMP_ID (both dispatches should fail) =="
 kubectl scale deployment/provisioning-service -n $NS --replicas=0 > /dev/null
 kubectl wait --for=delete pod -l app=provisioning-service -n $NS --timeout=60s > /dev/null 2>&1
 ok "provisioning-service scaled to 0"
 
-upload_csv 'EmployeeID,DisplayName
-' "dispatch-retry-verify/b.csv"   # E9001 absent -> terminated
+upload_csv "EmployeeID,DisplayName
+" "${SRC_NAME}/b.csv"   # $EMP_ID absent -> terminated
 OUT=$(run_curl drv-ingest-b -X POST http://flatfile-connector-service/ingest \
   -H 'Content-Type: application/json' \
-  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"dispatch-retry-verify/b.csv\",\"triggeredBy\":\"drv-b\"}")
+  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"${SRC_NAME}/b.csv\",\"triggeredBy\":\"drv-b\"}")
 echo "    ingest response: $OUT"
-echo "$OUT" | grep -q '"recordsTerminated":1' && ok "E9001 terminated (identity PATCH unaffected by provisioning-service outage)" \
+echo "$OUT" | grep -q '"recordsTerminated":1' && ok "$EMP_ID terminated (identity PATCH unaffected by provisioning-service outage)" \
   || bad "expected recordsTerminated:1: $OUT"
 echo "$OUT" | grep -q '2 apply failure' && ok "both dispatch attempts counted as apply failures" \
   || echo "    (check errorSummary above manually)"
@@ -127,8 +137,8 @@ echo ""
 echo "== 4. Confirm both targets landed in pendingProvisioningDispatch =="
 STATE=$(dump_state)
 echo "    state: $STATE"
-if echo "$STATE" | grep -q '"E9001"' && echo "$STATE" | grep -q '"ad"' && echo "$STATE" | grep -q '"entra"'; then
-  ok "pendingProvisioningDispatch has E9001: [ad, entra]"
+if echo "$STATE" | grep -q "\"$EMP_ID\"" && echo "$STATE" | grep -q '"ad"' && echo "$STATE" | grep -q '"entra"'; then
+  ok "pendingProvisioningDispatch has $EMP_ID: [ad, entra]"
 else
   bad "pendingProvisioningDispatch missing expected entry: $STATE"
 fi
@@ -148,7 +158,7 @@ ok "provisioning-service scaled back to 2"
 
 OUT=$(run_curl drv-ingest-c -X POST http://flatfile-connector-service/ingest \
   -H 'Content-Type: application/json' \
-  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"dispatch-retry-verify/b.csv\",\"triggeredBy\":\"drv-c\"}")
+  -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"${SRC_NAME}/b.csv\",\"triggeredBy\":\"drv-c\"}")
 echo "    ingest response: $OUT"
 if echo "$OUT" | grep -q '2 attempted, 2 succeeded, 0 correlation key(s) still pending'; then
   ok "retry attempted BOTH ad and entra (2/2) despite entra no longer being in provisioningTargets"
@@ -162,17 +172,17 @@ echo ""
 echo "== 7. Confirm pendingProvisioningDispatch is now cleared =="
 STATE=$(dump_state)
 echo "    state after retry: $STATE"
-if echo "$STATE" | grep -q '"pendingProvisioningDispatch":{}' || ! echo "$STATE" | grep -q '"E9001"'; then
-  ok "pendingProvisioningDispatch cleared for E9001 — nothing silently lost, both eventually dispatched"
+if echo "$STATE" | grep -q '"pendingProvisioningDispatch":{}' || ! echo "$STATE" | grep -q "\"$EMP_ID\""; then
+  ok "pendingProvisioningDispatch cleared for $EMP_ID — nothing silently lost, both eventually dispatched"
 else
-  bad "E9001 still present in pendingProvisioningDispatch: $STATE"
+  bad "$EMP_ID still present in pendingProvisioningDispatch: $STATE"
 fi
 
 echo ""
 echo "== Cleanup =="
 kubectl delete pod "$UP_POD" -n $NS --ignore-not-found > /dev/null 2>&1
 ok "upload pod removed"
-echo "    NOTE: dispatch-retry-verify source system ($SRC_ID) and E9001 left in place intentionally."
+echo "    NOTE: $SRC_NAME source system ($SRC_ID) and $EMP_ID left in place intentionally."
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then echo "=== DISPATCH RETRY VERIFICATION PASSED ==="; else echo "=== DISPATCH RETRY VERIFICATION FAILED ==="; fi
