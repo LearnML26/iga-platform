@@ -368,6 +368,21 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   Not run: ruff clean and both changed files compile, but no verify.sh /
   in-cluster smoke test — deploy.sh wasn't run per this task's scope
   (branch only, for review).
+  Live smoke test (3 rounds: create / update+terminate / provisioning
+  dispatch) run against the deployed cluster after merge. Create path,
+  termination detection, and dispatch (recordsTerminated correct in both
+  round 2 and round 3) all verified working. Found one real bug in the
+  process: recordsUpdated was inflated by +1 every round (every
+  previously-created identity, forever, not just the ones that actually
+  changed). Root cause — Pydantic v2's default `extra="ignore"` silently
+  drops a mapped-but-unrecognized attribute (the smoke test used
+  `EmployeeID→employeeId`, not a real IdentityIn field) on
+  `POST /identities`, but `update_identity`'s untyped dict merge persists
+  it on the very next PATCH — so ingest.py's per-field diff sees it as
+  "changed" against a `None` that was never really there, every time,
+  for every identity. Fixed by adding `model_config =
+  ConfigDict(extra="allow")` to IdentityIn so create matches update's
+  existing behavior (see fix/identity-extra-fields-allow branch/PR).
 - [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
