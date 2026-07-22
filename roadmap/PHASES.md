@@ -425,6 +425,27 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   verification (temporarily break one of two provisioningTargets, confirm
   the failure is retried and eventually dispatched on a later run) not
   yet run, see fix/provisioning-dispatch-retry branch/PR.
+  Two things found while planning that live verification, before running
+  it: (1) a bogus/unrecognized connectorType is NOT a usable way to force
+  a dispatch failure — `submit_task` never validates connectorType against
+  CONNECTOR_REGISTRY, only the async worker (`handle_message`) does, so
+  `POST /tasks` returns 202 for any string value regardless of validity.
+  A fake target fails later, asynchronously, in the worker's own
+  retry/dead-letter loop (the pre-existing, separately-tracked gap) — not
+  through `pendingProvisioningDispatch` at all. Forcing a real dispatch
+  failure needs an actual outage (e.g. scaling provisioning-service to 0
+  replicas), not a bad connectorType value.
+  (2) `_retry_pending_dispatches` does not consult the source instance's
+  *current* `provisioningTargets` — it blindly replays whatever was
+  already recorded as pending, regardless of later config changes.
+  Removing a target from `provisioningTargets` does not stop an
+  already-failed dispatch for that target from being retried; it'll keep
+  being retried (and, since dispatch success isn't gated on connectorType
+  validity, will likely "succeed" and clear on its very next attempt)
+  independent of the config. This matches what was actually asked for in
+  this fix (retry what already failed) — deciding whether a config change
+  should abandon a pending retry is a separate policy question, not
+  addressed here; noting it rather than expanding this fix's scope.
 - [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
