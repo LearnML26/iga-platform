@@ -20,7 +20,7 @@ from enum import Enum
 from typing import Optional, Any
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from azure.identity.aio import DefaultAzureCredential
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions as cosmos_exceptions
@@ -59,6 +59,15 @@ class IdentityType(str, Enum):
 
 
 class IdentityIn(BaseModel):
+    # extra="allow": PATCH (an untyped dict merge in update_identity) already
+    # persists any field a caller sends, known or not — create must match or
+    # a mapped-but-unrecognized attribute (e.g. a source connector's own key
+    # column) gets silently dropped on create yet "changes" on every
+    # subsequent PATCH forever, since it never existed to compare against.
+    # Found via the 2.3 live smoke test: this exact asymmetry inflated
+    # recordsUpdated by 1 every run for a mapping targeting `employeeId`.
+    model_config = ConfigDict(extra="allow")
+
     correlationKey: str
     identityType: IdentityType = IdentityType.employee
     displayName: str
