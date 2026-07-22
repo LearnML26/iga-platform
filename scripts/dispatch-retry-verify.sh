@@ -92,11 +92,14 @@ echo "    instance id: $SRC_ID"
 run_curl drv-mapping -X POST "http://source-system-service/source-systems/${SRC_ID}/mappings" \
   -H 'Content-Type: application/json' \
   -d '{"sourceAttribute":"EmployeeID","targetAttribute":"employeeId","isKey":true}' > /dev/null
+run_curl drv-mapping-2 -X POST "http://source-system-service/source-systems/${SRC_ID}/mappings" \
+  -H 'Content-Type: application/json' \
+  -d '{"sourceAttribute":"DisplayName","targetAttribute":"displayName","isKey":false}' > /dev/null
 
 echo ""
 echo "== 2. Create E9001 =="
-upload_csv 'EmployeeID
-E9001' "dispatch-retry-verify/a.csv"
+upload_csv 'EmployeeID,DisplayName
+E9001,Retry Test User' "dispatch-retry-verify/a.csv"
 OUT=$(run_curl drv-ingest-a -X POST http://flatfile-connector-service/ingest \
   -H 'Content-Type: application/json' \
   -d "{\"sourceSystemInstanceId\":\"${SRC_ID}\",\"blobPath\":\"dispatch-retry-verify/a.csv\",\"triggeredBy\":\"drv-a\"}")
@@ -109,7 +112,7 @@ kubectl scale deployment/provisioning-service -n $NS --replicas=0 > /dev/null
 kubectl wait --for=delete pod -l app=provisioning-service -n $NS --timeout=60s > /dev/null 2>&1
 ok "provisioning-service scaled to 0"
 
-upload_csv 'EmployeeID
+upload_csv 'EmployeeID,DisplayName
 ' "dispatch-retry-verify/b.csv"   # E9001 absent -> terminated
 OUT=$(run_curl drv-ingest-b -X POST http://flatfile-connector-service/ingest \
   -H 'Content-Type: application/json' \
