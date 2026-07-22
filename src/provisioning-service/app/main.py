@@ -123,7 +123,7 @@ async def submit_task(task: ProvisioningTask):
 async def worker_loop() -> None:
     while True:
         try:
-            async with app.state.sb.get_queue_session_receiver(
+            async with app.state.sb.get_queue_receiver(
                 TASK_QUEUE, session_id=NEXT_AVAILABLE_SESSION, max_wait_time=30
             ) as receiver:
                 async for msg in receiver:
