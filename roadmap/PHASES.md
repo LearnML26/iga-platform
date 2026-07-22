@@ -262,9 +262,16 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via
   notification queue; approval → provisioning task.
-- [ ] **3.3 notification-service** — consumes notification-tasks queue,
+- [x] **3.3 notification-service** — consumes notification-tasks queue,
   sends email via ACS Email or SMTP relay [HUMAN gate: provide sender config
   as Key Vault secrets]. Webhook fan-out for ProvisioningFailed.
+  DONE (scaffold, unverified in a live cluster): SMTP relay chosen over ACS
+  Email (no ACS resource exists in infra/ yet); non-session consumer of
+  notification-tasks (verified sessions:false in messaging.bicep) dispatches
+  ProvisioningFailed to email + webhook fan-out; sender config is a
+  [HUMAN gate] — service degrades to log-and-skip until the
+  `notification-sender` Key Vault secrets/k8s Secret are populated (see
+  scripts/deploy.sh next-steps output).
 - [ ] **3.4 React frontend scaffold** — REQ-UI-001..005, 010..017. Vite +
   React + TypeScript in `web/`. MSAL.js auth-code+PKCE against Entra
   [HUMAN gate: SPA app registration]. Unified login page per REQ-UI-010/013,

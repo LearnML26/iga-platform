@@ -51,7 +51,7 @@ kubelogin convert-kubeconfig -l azurecli
 OIDC_ISSUER=$(az aks show -g "$RG_COMPUTE" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 
 declare -A SVC_CLIENT_IDS
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service; do
   MI_NAME="mi-${SUFFIX}-${SVC}"
   az identity create -g "$RG_COMPUTE" -n "$MI_NAME" -l "$LOCATION" -o none
   CLIENT_ID=$(az identity show -g "$RG_COMPUTE" -n "$MI_NAME" --query clientId -o tsv)
@@ -92,8 +92,16 @@ az role assignment create --assignee "$FFC_PRINCIPAL" \
   --role "Storage Blob Data Contributor" \
   --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" -o none || true
 
+# Service Bus Data Receiver for notification-service (Phase 3.3) — it only
+# consumes 'notification-tasks', never sends, so Receiver (not Owner, unlike
+# provisioning-service which both sends and receives) is least-privilege.
+NOTIF_PRINCIPAL=$(az identity show -g "$RG_COMPUTE" -n "mi-${SUFFIX}-notification-service" --query principalId -o tsv)
+az role assignment create --assignee "$NOTIF_PRINCIPAL" \
+  --role "Azure Service Bus Data Receiver" \
+  --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
+
 echo "==> [4/5] Building and pushing images (ACR server-side build — no local Docker needed)"
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service; do
   # az acr build uploads the context, builds in ACR, and pushes the image
   # to ${ACR_LOGIN_SERVER}/${SVC}:${IMAGE_TAG} automatically on success.
   az acr build \
@@ -112,6 +120,7 @@ export IDENTITY_SVC_CLIENT_ID="${SVC_CLIENT_IDS[identity-service]}"
 export PROVISIONING_SVC_CLIENT_ID="${SVC_CLIENT_IDS[provisioning-service]}"
 export SOURCE_SYSTEM_SVC_CLIENT_ID="${SVC_CLIENT_IDS[source-system-service]}"
 export FLATFILE_CONNECTOR_SVC_CLIENT_ID="${SVC_CLIENT_IDS[flatfile-connector-service]}"
+export NOTIFICATION_SVC_CLIENT_ID="${SVC_CLIENT_IDS[notification-service]}"
 export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
 export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
 export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv)"
@@ -143,6 +152,10 @@ kubectl get pods -n iga
 echo ""
 echo "Next steps:"
 echo "  - Store AD connector bind credentials in Key Vault kv-${SUFFIX} and sync to the 'ad-connector' k8s secret via CSI SecretProviderClass"
+echo "  - [HUMAN gate, Phase 3.3] Store notification-service sender config in Key Vault kv-${SUFFIX} and sync to the"
+echo "    'notification-sender' k8s secret (same manual/CSI pattern as ad-connector above). Until this is done the"
+echo "    service stays healthy but logs+skips email/webhook delivery. See the notification-service task's printed"
+echo "    'az keyvault secret set' commands for the exact secret names/keys."
 echo "  - Grant the Entra connector managed identity Graph GroupMember.ReadWrite.All (admin consent required)"
 echo "  - [ONE-TIME, HUMAN] Grant source-system-service's managed identity access to sqldb-sourcesystem."
 echo "    sql-${SUFFIX} has publicNetworkAccess Disabled, so this SQL must run from inside the VNet"

@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notification-service
+  namespace: iga
+  annotations:
+    azure.workload.identity/client-id: "${NOTIFICATION_SVC_CLIENT_ID}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: iga
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: notification-service }
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: notification-service
+      containers:
+        - name: notification-service
+          image: ${ACR_LOGIN_SERVER}/notification-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: SERVICEBUS_NAMESPACE, value: "${SERVICEBUS_NAMESPACE}.servicebus.windows.net" }
+            # Sender config below is a [HUMAN gate] per CLAUDE.md guardrail #1
+            # (roadmap/PHASES.md 3.3): populate the 'notification-sender' k8s
+            # Secret from Key Vault before this service can actually send —
+            # see the notification-service section of scripts/deploy.sh's
+            # printed next-steps for the exact `az keyvault secret set` /
+            # `kubectl create secret` commands. Every key is optional so the
+            # pod stays healthy (and just logs+skips the channel) if not yet
+            # populated, matching provisioning-service's ad-connector secret
+            # pattern.
+            - name: SMTP_HOST
+              valueFrom: { secretKeyRef: { name: notification-sender, key: smtp-host, optional: true } }
+            - name: SMTP_PORT
+              valueFrom: { secretKeyRef: { name: notification-sender, key: smtp-port, optional: true } }
+            - name: SMTP_USERNAME
+              valueFrom: { secretKeyRef: { name: notification-sender, key: smtp-username, optional: true } }
+            - name: SMTP_PASSWORD
+              valueFrom: { secretKeyRef: { name: notification-sender, key: smtp-password, optional: true } }
+            - name: NOTIFY_EMAIL_FROM
+              valueFrom: { secretKeyRef: { name: notification-sender, key: email-from, optional: true } }
+            - name: NOTIFY_EMAIL_TO
+              valueFrom: { secretKeyRef: { name: notification-sender, key: email-to, optional: true } }
+            - name: NOTIFY_WEBHOOK_URLS
+              valueFrom: { secretKeyRef: { name: notification-sender, key: webhook-urls, optional: true } }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: iga
+spec:
+  selector: { app: notification-service }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+# Ingress on 8080 and intra-namespace egress are already covered generically
+# by allow-intra-namespace-app (podSelector: {} in k8s/base/namespace.yaml —
+# applies to every pod, so a new service needs no new NetworkPolicy for
+# those). The one NEW egress destination this service needs is the SMTP
+# relay (port 587), added as an explicit default-deny egress rule in
+# k8s/base/namespace.yaml (Phase 3.3) per CLAUDE.md's NetworkPolicy note.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: notification-service
+  namespace: iga
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: notification-service }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
