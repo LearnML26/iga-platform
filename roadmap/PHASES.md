@@ -147,9 +147,17 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   yet either — REQ-NFR-021 is about the storage control existing and being
   correctly configured, not about wiring a writer, which isn't scoped to
   any task in this backlog yet.
-- [ ] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
+- [x] **1R.5 Repo to remote + CI live** — Push to GitHub/Azure Repos [HUMAN
   provides the remote URL + auth]. Confirm ci.yaml runs green. Configure the
   OIDC federated credential for the pipeline identity [HUMAN gate].
+  Done — repo is at github.com/LearnML26/iga-platform, `main` pushed.
+  Confirmed via the Actions API rather than assuming: latest `ci` run
+  (29909414430, triggered by the notification-service PR #1 merge) shows
+  `validate` green (Bicep build, ruff, Trivy scan) and every `build-push`
+  matrix job (identity-service, provisioning-service, source-system-service,
+  flatfile-connector-service, notification-service) green too, including
+  the OIDC `azure/login@v2` step — so the federated credential for the
+  pipeline identity is configured and working, not just present in YAML.
 - [x] **1R.6 Entra connector consent** — [HUMAN] Grant provisioning-service's
   managed identity Graph app permission GroupMember.ReadWrite.All + admin
   consent. Agent then: create a test task via POST /tasks targeting a test
