@@ -21,12 +21,30 @@ discover a key that's now *absent*. There is no bulk "list identities for
 this source system" query, so this connector still keeps a minimal local
 state at `curated/source-state/<instanceId>/latest.json` — but as of 2.3 it
 is just the *set* of correlation keys seen as of the last completed run, no
-longer a content-hash snapshot (see `_load_known_keys`/`_save_known_keys`).
-A key that was known and is absent from the current file gets its identity
-PATCHed to status=terminated, and — for each entry in that source system
-instance's `provisioningTargets` — a disable-account task is POSTed to
+longer a content-hash snapshot (see `_load_state`/`_save_state`). A key that
+was known and is absent from the current file gets its identity PATCHed to
+status=terminated, and — for each entry in that source system instance's
+`provisioningTargets` — a disable-account task is POSTed to
 provisioning-service. An empty `provisioningTargets` is a valid, safe
 default (nothing dispatched, just logged), not an error condition.
+
+Provisioning-dispatch retry (post-2.3 fix): a POST /tasks failure for one
+target in a multi-target provisioningTargets list used to just count toward
+the apply-failure threshold and get silently lost forever — by the time the
+dispatch loop runs, the identity's correlation key has already been removed
+from the known-keys set (it's terminated), so no future run's termination
+pass would ever revisit it. The same state file now also carries a sibling
+`pendingProvisioningDispatch: {correlationKey: [connectorType, ...]}` map of
+dispatches still owed. At the start of every run, before touching the
+current file's rows, any entries left over from a prior run are retried
+(re-resolving the identity via GET by-correlation-key — its status=
+terminated PATCH already happened, this only re-sends the disable-account
+task) via `_retry_pending_dispatches`; a repeat failure counts toward this
+run's apply-failure threshold exactly like any other apply failure and
+stays in the map for the next run. This does not add any saga/rollback
+mechanism — the status=terminated PATCH in `_apply_terminations` is
+unaffected and still applied immediately; only the dispatch loop's failure
+handling changed.
 
 Known, deliberately out-of-scope gap: there is no target-system-instance
 registry or account-identifier mapping (userDn/userObjectId) anywhere in the
@@ -46,11 +64,12 @@ malformed-row quarantine is a separate, already-handled concern and never
 counts here. Crossing the threshold stops processing remaining rows in this
 run (no more identity-service/provisioning-service calls) but does NOT roll
 back rows already applied — there's no compensation/saga mechanism here.
-The known-keys snapshot is saved reflecting exactly what was durably applied
-before the halt, so the next run resumes correctly. The FeedRun is marked
-`failed` with attempted/succeeded/apply-failure counts folded into
-`errorSummary` (no new FeedRun columns were added for this — it reuses the
-existing free-text field, same as the other operational notes below).
+The known-keys/pending-dispatch state is saved reflecting exactly what was
+durably applied before the halt, so the next run resumes correctly. The
+FeedRun is marked `failed` with attempted/succeeded/apply-failure counts
+folded into `errorSummary` (no new FeedRun columns were added for this — it
+reuses the existing free-text field, same as the other operational notes
+below).
 
 Auth: identity-service and provisioning-service both validate a bearer token
 against the `iga-platform-api` app registration (REQ-COR-API-001/002, Phase
@@ -220,14 +239,99 @@ async def _call(coro) -> tuple[Optional[httpx.Response], Optional[str]]:
         return None, f"{type(e).__name__}: {e}"
 
 
+def _disable_account_task(feed_run_id: str, instance_id: str, identity_id: str, key: str, connector_type: str) -> dict:
+    return {
+        "sourceType": "source-feed",
+        "sourceRef": feed_run_id,
+        "identityId": identity_id,
+        "instanceId": instance_id,
+        "connectorType": connector_type,
+        "operationType": "disable-account",
+        "payload": {"correlationKey": key},
+    }
+
+
+async def _retry_pending_dispatches(
+    identity_http: httpx.AsyncClient,
+    provisioning_http: httpx.AsyncClient,
+    instance_id: str,
+    feed_run_id: str,
+    pending: dict[str, list[str]],
+    threshold: int,
+) -> dict[str, Any]:
+    """Re-attempt provisioning-task dispatches that failed on a prior run,
+    before this run's own file is applied. The identity's status=terminated
+    PATCH already happened when it was first terminated — that's not
+    repeated here — this only re-sends the disable-account task(s) that
+    never got a 202. Failures (or targets never reached because the
+    threshold was hit) stay in the returned `remaining` map for next time;
+    nothing is ever dropped silently."""
+    attempted = succeeded = failed = 0
+    halted = False
+    halt_reason: Optional[str] = None
+    remaining: dict[str, list[str]] = {}
+
+    keys = list(pending.keys())
+    i = 0
+    while i < len(keys) and not halted:
+        key = keys[i]
+        targets = pending[key]
+        i += 1
+
+        resp, err = await _call(identity_http.get(f"/identities/by-correlation-key/{quote(key, safe='')}"))
+        if err or resp.status_code not in (200, 404):
+            failed += 1
+            remaining[key] = list(targets)
+            if failed >= threshold:
+                halted, halt_reason = True, err or f"GET by-correlation-key returned {resp.status_code} for '{key}'"
+            continue
+        if resp.status_code == 404:
+            log.warning("pending dispatch retry: '%s' has no identity-service record; dropping %s", key, targets)
+            continue
+        existing = resp.json()
+
+        still_failing: list[str] = []
+        for ti in range(len(targets)):
+            connector_type = targets[ti]
+            attempted += 1
+            resp2, err2 = await _call(provisioning_http.post(
+                "/tasks", json=_disable_account_task(feed_run_id, instance_id, existing["identityId"], key, connector_type)
+            ))
+            if err2 or resp2.status_code != 202:
+                failed += 1
+                still_failing.append(connector_type)
+                if failed >= threshold:
+                    halted = True
+                    halt_reason = err2 or f"POST /tasks (disable-account retry, {connector_type}) returned {resp2.status_code}"
+                    still_failing.extend(targets[ti + 1:])
+                    break
+            else:
+                succeeded += 1
+        if still_failing:
+            remaining[key] = still_failing
+
+    for key in keys[i:]:
+        remaining[key] = list(pending[key])
+
+    return {
+        "attempted": attempted, "succeeded": succeeded, "failed": failed,
+        "halted": halted, "halt_reason": halt_reason, "remaining": remaining,
+    }
+
+
 async def _apply_added_updated(
-    identity_http: httpx.AsyncClient, instance_id: str, unique_rows: dict[str, dict[str, Any]], threshold: int
+    identity_http: httpx.AsyncClient,
+    instance_id: str,
+    unique_rows: dict[str, dict[str, Any]],
+    threshold: int,
+    failed_so_far: int = 0,
 ) -> dict[str, Any]:
     """Add/update pass (REQ-COR-SRC-006): resolve each row's correlation key
     against identity-service and create-or-patch accordingly. Halts once
-    `threshold` apply failures accumulate (REQ-COR-SRC-009); does not roll
-    back rows already applied."""
-    added = updated = succeeded = attempted = failed = 0
+    `threshold` cumulative apply failures accumulate (REQ-COR-SRC-009); does
+    not roll back rows already applied."""
+    added = updated = succeeded = attempted = 0
+    failed = failed_so_far
     applied_keys: set[str] = set()
     halted = False
     halt_reason: Optional[str] = None
@@ -289,14 +393,19 @@ async def _apply_terminations(
     failed_so_far: int,
 ) -> dict[str, Any]:
     """Termination pass: a key known as of the last run but absent from this
-    one gets its identity PATCHed to status=terminated, then a
-    disable-account task is dispatched to each of the source instance's
-    provisioningTargets (none configured -> logged, not an error)."""
+    one gets its identity PATCHed to status=terminated (always applied
+    immediately, regardless of what happens next), then a disable-account
+    task is dispatched to each of the source instance's provisioningTargets
+    (none configured -> logged, not an error). A target whose dispatch
+    fails — or is never reached because the threshold was hit — is recorded
+    in `failed_target_dispatches` for the caller to persist and retry on a
+    future run, rather than being silently lost."""
     terminated = succeeded = attempted = 0
     failed = failed_so_far
     halted = False
     halt_reason: Optional[str] = None
     removed_keys: set[str] = set()
+    failed_target_dispatches: dict[str, list[str]] = {}
 
     for key in terminated_keys:
         attempted += 1
@@ -344,25 +453,23 @@ async def _apply_terminations(
             succeeded += 1
             continue
 
-        dispatch_failed = False
-        for connector_type in provisioning_targets:
-            task_body = {
-                "sourceType": "source-feed",
-                "sourceRef": feed_run_id,
-                "identityId": existing["identityId"],
-                "instanceId": instance_id,
-                "connectorType": connector_type,
-                "operationType": "disable-account",
-                "payload": {"correlationKey": key},
-            }
-            resp3, err3 = await _call(provisioning_http.post("/tasks", json=task_body))
+        failed_targets: list[str] = []
+        for ti in range(len(provisioning_targets)):
+            connector_type = provisioning_targets[ti]
+            resp3, err3 = await _call(provisioning_http.post(
+                "/tasks", json=_disable_account_task(feed_run_id, instance_id, existing["identityId"], key, connector_type)
+            ))
             if err3 or resp3.status_code != 202:
                 failed += 1
-                dispatch_failed = True
+                failed_targets.append(connector_type)
                 if failed >= threshold:
-                    halted, halt_reason = True, err3 or f"POST /tasks (disable-account, {connector_type}) returned {resp3.status_code}"
+                    halted = True
+                    halt_reason = err3 or f"POST /tasks (disable-account, {connector_type}) returned {resp3.status_code}"
+                    failed_targets.extend(provisioning_targets[ti + 1:])
                     break
-        if not dispatch_failed:
+        if failed_targets:
+            failed_target_dispatches[key] = failed_targets
+        else:
             succeeded += 1
         if halted:
             break
@@ -370,6 +477,7 @@ async def _apply_terminations(
     return {
         "terminated": terminated, "succeeded": succeeded, "attempted": attempted, "failed": failed,
         "halted": halted, "halt_reason": halt_reason, "removed_keys": removed_keys,
+        "failed_target_dispatches": failed_target_dispatches,
     }
 
 
@@ -447,15 +555,29 @@ async def _process(
         unmatched_count = sum(len(v) for v in duplicate_keys.values())
         unique_rows = {k: v[0][1] for k, v in rows_by_key.items() if len(v) == 1}
 
-        previous_keys = await _load_known_keys(curated_container, instance_id)
+        previous_keys, pending_dispatches = await _load_state(curated_container, instance_id)
+        pending_at_start = dict(pending_dispatches)
 
-        apply = await _apply_added_updated(identity_http, instance_id, unique_rows, APPLY_FAILURE_THRESHOLD)
+        retry = await _retry_pending_dispatches(
+            identity_http, provisioning_http, instance_id, feed_run_id,
+            pending_dispatches, APPLY_FAILURE_THRESHOLD,
+        )
+        pending_dispatches = retry["remaining"]
+        apply_failed = retry["failed"]
+        halted, halt_reason = retry["halted"], retry["halt_reason"]
+
+        apply: dict[str, Any] = {"added": 0, "updated": 0, "succeeded": 0, "attempted": 0, "applied_keys": set()}
+        if not halted:
+            apply = await _apply_added_updated(
+                identity_http, instance_id, unique_rows, APPLY_FAILURE_THRESHOLD, apply_failed
+            )
+            apply_failed = apply["failed"]
+            halted, halt_reason = apply["halted"], apply["halt_reason"]
+
         known_keys = set(previous_keys) | apply["applied_keys"]
 
         terminated = term_succeeded = term_attempted = 0
-        apply_failed = apply["failed"]
-        halted, halt_reason = apply["halted"], apply["halt_reason"]
-
+        failed_target_dispatches: dict[str, list[str]] = {}
         if not halted:
             terminated_keys = set(previous_keys) - set(unique_rows) - set(duplicate_keys)
             term = await _apply_terminations(
@@ -468,10 +590,15 @@ async def _process(
             apply_failed = term["failed"]
             halted, halt_reason = term["halted"], term["halt_reason"]
             known_keys -= term["removed_keys"]
+            failed_target_dispatches = term["failed_target_dispatches"]
+
+        pending_dispatches.update(failed_target_dispatches)
 
         # Persist exactly what was durably applied, halted or not — no
         # rollback, so the next run resumes from real state (REQ-COR-SRC-009).
-        await _save_known_keys(curated_container, instance_id, known_keys)
+        # pendingProvisioningDispatch ensures a partially-dispatched
+        # termination's remaining task(s) are never silently lost.
+        await _save_state(curated_container, instance_id, known_keys, pending_dispatches)
 
         quarantine_path = None
         if quarantined:
@@ -489,9 +616,14 @@ async def _process(
             notes.append(f"unrecognized transform(s) ignored: {sorted(unknown_transforms)}")
         if quarantine_path:
             notes.append(f"{len(quarantined)} row(s) quarantined at {RAW_CONTAINER}/{quarantine_path}")
+        if pending_at_start:
+            notes.append(
+                f"provisioning-dispatch retries from a prior run: {retry['attempted']} attempted, "
+                f"{retry['succeeded']} succeeded, {len(retry['remaining'])} correlation key(s) still pending"
+            )
 
-        total_attempted = apply["attempted"] + term_attempted
-        total_succeeded = apply["succeeded"] + term_succeeded
+        total_attempted = retry["attempted"] + apply["attempted"] + term_attempted
+        total_succeeded = retry["succeeded"] + apply["succeeded"] + term_succeeded
         apply_note = (
             f"identity-service/provisioning-service apply: {total_attempted} row(s) attempted, "
             f"{total_succeeded} succeeded, {apply_failed} apply failure(s)"
@@ -517,25 +649,33 @@ async def _process(
         return summary
 
 
-async def _load_known_keys(curated_container, instance_id: str) -> set[str]:
-    """Correlation keys this connector believes are currently active for
-    this source, as of the last completed run — used solely to detect
-    terminations (a key that was known and is now absent from the file).
-    Add/update decisions and identity data come from identity-service
-    itself (2.3); this is deliberately not a content snapshot any more."""
+async def _load_state(curated_container, instance_id: str) -> tuple[set[str], dict[str, list[str]]]:
+    """Connector-owned state for this source instance: the set of
+    correlation keys known active as of the last completed run (used
+    solely to detect terminations — add/update decisions and identity data
+    come from identity-service itself), and any provisioning-task
+    dispatches that failed and still need a retry (correlationKey -> list
+    of connectorType targets not yet successfully dispatched)."""
     try:
         client = curated_container.get_blob_client(f"source-state/{instance_id}/latest.json")
         downloader = await client.download_blob()
         raw = await downloader.readall()
-        return set(json.loads(raw)["correlationKeys"])
+        doc = json.loads(raw)
+        return set(doc.get("correlationKeys", [])), dict(doc.get("pendingProvisioningDispatch", {}))
     except ResourceNotFoundError:
-        return set()
+        return set(), {}
 
 
-async def _save_known_keys(curated_container, instance_id: str, known_keys: set[str]) -> None:
+async def _save_state(
+    curated_container, instance_id: str, known_keys: set[str], pending_dispatches: dict[str, list[str]]
+) -> None:
     client = curated_container.get_blob_client(f"source-state/{instance_id}/latest.json")
     await client.upload_blob(
-        json.dumps({"correlationKeys": sorted(known_keys)}).encode("utf-8"), overwrite=True
+        json.dumps({
+            "correlationKeys": sorted(known_keys),
+            "pendingProvisioningDispatch": {k: sorted(v) for k, v in pending_dispatches.items() if v},
+        }).encode("utf-8"),
+        overwrite=True,
     )
 
 
