@@ -146,9 +146,9 @@ done
 
 # 3. upload round1.csv
 upload_csv 'EmployeeID,FirstName,LastName,DisplayName,Department
-E1001,Alice,Wong,Alice Wong,Engineering
-E1002,Ben,Diaz,Ben Diaz,Sales
-E1003,Carla,Smith,Carla Smith,Engineering' "hr-smoke-test/round1.csv"
+E2001,Alice,Wong,Alice Wong,Engineering
+E2002,Ben,Diaz,Ben Diaz,Sales
+E2003,Carla,Smith,Carla Smith,Engineering' "hr-smoke-test/round1.csv"
 ok "round1.csv uploaded"
 
 # 4. ingest
@@ -165,9 +165,9 @@ else
   bad "round 1 ingest did not match expected deltas: $OUT"
 fi
 
-# 5. confirm E1001/E1002/E1003 active
+# 5. confirm E2001/E2002/E2003 active
 declare -A IDENTITY_ID  # correlationKey -> identityId, reused in later rounds
-for KEY in E1001 E1002 E1003; do
+for KEY in E2001 E2002 E2003; do
   OUT=$(run_curl "r23-get-$KEY" "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$KEY")
   if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"active"'; then
     ok "$KEY exists and is active"
@@ -176,16 +176,16 @@ for KEY in E1001 E1002 E1003; do
   fi
   IDENTITY_ID[$KEY]=$(echo "$OUT" | grep -o '"identityId":"[^"]*"' | head -1 | cut -d'"' -f4)
 done
-echo "    identityIds: ${IDENTITY_ID[E1001]:-?} / ${IDENTITY_ID[E1002]:-?} / ${IDENTITY_ID[E1003]:-?}"
+echo "    identityIds: ${IDENTITY_ID[E2001]:-?} / ${IDENTITY_ID[E2002]:-?} / ${IDENTITY_ID[E2003]:-?}"
 
 # ============================================================================
 echo ""
 echo "== Round 2: update + termination =="
-# 6. round2.csv — Carla's department changes, E1002 dropped, E1004 added
+# 6. round2.csv — Carla's department changes, E2002 dropped, E2004 added
 upload_csv 'EmployeeID,FirstName,LastName,DisplayName,Department
-E1001,Alice,Wong,Alice Wong,Engineering
-E1003,Carla,Smith,Carla Smith,Product
-E1004,Dana,Lee,Dana Lee,Sales' "hr-smoke-test/round2.csv"
+E2001,Alice,Wong,Alice Wong,Engineering
+E2003,Carla,Smith,Carla Smith,Product
+E2004,Dana,Lee,Dana Lee,Sales' "hr-smoke-test/round2.csv"
 ok "round2.csv uploaded"
 
 # 7. ingest
@@ -202,17 +202,17 @@ else
   bad "round 2 ingest did not match expected deltas: $OUT"
 fi
 
-# 8. confirm E1002 terminated, and (since provisioningTargets was still [])
+# 8. confirm E2002 terminated, and (since provisioningTargets was still [])
 #    that nothing was dispatched for it — the errorSummary's apply tally
 #    covers this: 0 apply failures and no dispatch note, per ingest.py's
 #    _apply_terminations logging-only path for an empty provisioningTargets.
-OUT=$(run_curl r23-get-E1002-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E1002")
+OUT=$(run_curl r23-get-E2002-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2002")
 if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"terminated"'; then
-  ok "E1002 is now terminated"
+  ok "E2002 is now terminated"
 else
-  bad "E1002 not terminated as expected: $OUT"
+  bad "E2002 not terminated as expected: $OUT"
 fi
-echo "    (E1002 has no provisioning tasks: provisioningTargets was [] at ingest time — see round 2's errorSummary above, printed with the ingest response)"
+echo "    (E2002 has no provisioning tasks: provisioningTargets was [] at ingest time — see round 2's errorSummary above, printed with the ingest response)"
 
 # ============================================================================
 echo ""
@@ -227,10 +227,10 @@ else
   bad "PATCH provisioningTargets failed or didn't stick: $OUT"
 fi
 
-# 10. round3.csv — E1003 (Carla) dropped
+# 10. round3.csv — E2003 (Carla) dropped
 upload_csv 'EmployeeID,FirstName,LastName,DisplayName,Department
-E1001,Alice,Wong,Alice Wong,Engineering
-E1004,Dana,Lee,Dana Lee,Sales' "hr-smoke-test/round3.csv"
+E2001,Alice,Wong,Alice Wong,Engineering
+E2004,Dana,Lee,Dana Lee,Sales' "hr-smoke-test/round3.csv"
 ok "round3.csv uploaded"
 
 OUT=$(run_curl r23-ingest-3 -X POST http://flatfile-connector-service/ingest \
@@ -246,16 +246,16 @@ else
   bad "round 3 ingest did not match expected deltas: $OUT"
 fi
 
-# 11a. confirm E1003 terminated
-OUT=$(run_curl r23-get-E1003-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E1003")
+# 11a. confirm E2003 terminated
+OUT=$(run_curl r23-get-E2003-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2003")
 if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"terminated"'; then
-  ok "E1003 is now terminated"
+  ok "E2003 is now terminated"
 else
-  bad "E1003 not terminated as expected: $OUT"
+  bad "E2003 not terminated as expected: $OUT"
 fi
-E1003_ID="${IDENTITY_ID[E1003]:-}"
+E2003_ID="${IDENTITY_ID[E2003]:-}"
 
-# 11b. primary evidence a disable-account task for E1003/ad was dispatched:
+# 11b. primary evidence a disable-account task for E2003/ad was dispatched:
 # ingest.py's _apply_terminations only increments the "succeeded" tally (and
 # leaves apply-failure count unchanged) when POST /tasks returns 202 — so a
 # clean (non-halted, 0-new-apply-failure) round-3 result for a termination
@@ -264,20 +264,20 @@ E1003_ID="${IDENTITY_ID[E1003]:-}"
 # signal (the API-side "queued" log line, then — since the worker polls
 # continuously — very likely the first AD-connector failure attempt too;
 # full dead-letter takes ~2.5h of backoff and is NOT waited for here).
-echo "    checking provisioning-service logs for E1003's task (identityId=${E1003_ID:-unknown})..."
+echo "    checking provisioning-service logs for E2003's task (identityId=${E2003_ID:-unknown})..."
 FOUND_QUEUED=0
 FOUND_AD_ATTEMPT=0
 for i in $(seq 1 8); do
   LOGS=$(kubectl logs -n $NS -l app=provisioning-service --all-containers --since=3m 2>/dev/null)
-  if [ -n "${E1003_ID:-}" ] && echo "$LOGS" | grep -q "$E1003_ID"; then
-    echo "$LOGS" | grep "$E1003_ID" | grep -qi "queued" && FOUND_QUEUED=1
+  if [ -n "${E2003_ID:-}" ] && echo "$LOGS" | grep -q "$E2003_ID"; then
+    echo "$LOGS" | grep "$E2003_ID" | grep -qi "queued" && FOUND_QUEUED=1
     echo "$LOGS" | grep -qi "ad operation failed\|no connector registered\|ConnectorError" && FOUND_AD_ATTEMPT=1
     [ "$FOUND_QUEUED" -eq 1 ] && break
   fi
   sleep 5
 done
 if [ "$FOUND_QUEUED" -eq 1 ]; then
-  ok "provisioning-service logs confirm a task was queued for E1003 (connectorType=ad, operationType=disable-account)"
+  ok "provisioning-service logs confirm a task was queued for E2003 (connectorType=ad, operationType=disable-account)"
 else
   echo "    (could not independently confirm via logs within 40s — not fatal; the FeedRun-summary check above is the primary assertion this task specifies)"
 fi
@@ -289,7 +289,7 @@ echo ""
 echo "== Cleanup =="
 kubectl delete pod "$UP_POD" -n $NS --ignore-not-found > /dev/null 2>&1
 ok "upload pod removed"
-echo "    NOTE: hr-smoke-test source system ($SRC_ID), its identities (E1001/E1002/E1003/E1004),"
+echo "    NOTE: hr-smoke-test source system ($SRC_ID), its identities (E2001/E2002/E2003/E2004),"
 echo "    and the queued disable-account task are left in place intentionally — this is dev data,"
 echo "    delete manually if you want it gone (the task will dead-letter itself in ~2.5h regardless)."
 
