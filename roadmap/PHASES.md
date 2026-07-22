@@ -404,6 +404,27 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   a closer look if it recurs. Doesn't affect the conclusion above: the
   delta-summary numbers come from the application's own internal calls,
   which is the authoritative evidence and was consistently correct.
+  Follow-up fix: a partial provisioning-dispatch failure (one target in a
+  multi-target provisioningTargets list) used to be silently permanent —
+  by the time the dispatch loop runs, the identity's correlationKey is
+  already dropped from the known-keys set, so no future run's termination
+  pass would ever see it again to retry. Fixed by extending the same
+  connector-owned state file (curated/source-state/<instanceId>/
+  latest.json) with a sibling `pendingProvisioningDispatch:
+  {correlationKey: [connectorType,...]}` map — no SQL migration, stays
+  scoped to ingest.py. Every run now retries any leftover entries first
+  (re-resolving the identity via GET by-correlation-key; the
+  status=terminated PATCH already happened and isn't repeated), before
+  touching the current file; a repeat failure counts toward the same
+  apply-failure threshold as everything else and stays in the map rather
+  than being dropped. `_apply_terminations`'s core logic (the
+  status=terminated PATCH itself) is unchanged — only the dispatch loop's
+  failure handling changed. Still explicitly no saga/rollback mechanism,
+  per 2.3's original scope note. ruff clean and the file compiles; no new
+  test framework introduced (none exists in this repo yet) — live
+  verification (temporarily break one of two provisioningTargets, confirm
+  the failure is retried and eventually dispatched on a later run) not
+  yet run, see fix/provisioning-dispatch-retry branch/PR.
 - [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
