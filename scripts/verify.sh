@@ -220,6 +220,87 @@ else
   bad "flatfile connector: source system id not captured — skipped ingest check"
 fi
 
+# notification-service (3.3): health + a real end-to-end queue smoke test.
+# It has no domain HTTP API of its own (pure Service Bus consumer + email/
+# webhook fan-out worker — see src/notification-service/app/main.py), so
+# instead of a curl-based create/dedupe test like the other services, this
+# publishes a synthetic ProvisioningFailed message onto the non-session
+# 'notification-tasks' queue (confirmed sessions:false in
+# infra/modules/messaging.bicep, shape matches provisioning-service's
+# notify_failure() exactly) using provisioning-service's own workload
+# identity (already granted Service Bus Data Owner in this script), then
+# polls the queue's activeMessageCount back down to 0 to confirm
+# notification-service actually received, parsed, dispatched, and completed
+# it. Email/webhook delivery itself is NOT asserted here — those channels
+# legitimately no-op-and-log until the human populates the
+# 'notification-sender' k8s secret (Phase 3.3 [HUMAN gate]); this test only
+# proves the consumer wiring (auth, queue name, message parsing, dispatch)
+# is correct end to end.
+OUT=$(run_curl vrfy-notif-health http://notification-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "notification-service /healthz 200" || bad "notification-service health failed: $OUT"
+
+NOTIF_POD="vrfy-notif-publish"
+kubectl delete pod "$NOTIF_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+cat <<PODYAML | kubectl apply -f - > /dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $NOTIF_POD
+  namespace: $NS
+  labels: { azure.workload.identity/use: "true" }
+spec:
+  serviceAccountName: provisioning-service
+  restartPolicy: Never
+  containers:
+    - name: publish
+      image: mcr.microsoft.com/azure-cli:latest
+      command: ["sleep", "90"]
+PODYAML
+if kubectl wait --for=condition=Ready "pod/$NOTIF_POD" -n $NS --timeout=60s > /dev/null 2>&1; then
+  # DefaultAzureCredential picks up the pod's workload-identity env vars
+  # (AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE, injected
+  # by the AKS webhook) automatically — no explicit az login needed here,
+  # unlike the bearer-token curl tests above.
+  kubectl exec -n $NS "$NOTIF_POD" -- env SERVICEBUS_NAMESPACE=sb-iga-dev.servicebus.windows.net bash -c '
+    python3 -m pip install --quiet azure-servicebus azure-identity > /dev/null 2>&1
+    python3 - <<PY
+import asyncio, json, os, uuid
+from azure.identity.aio import DefaultAzureCredential
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus import ServiceBusMessage
+
+async def main():
+    cred = DefaultAzureCredential()
+    async with ServiceBusClient(fully_qualified_namespace=os.environ["SERVICEBUS_NAMESPACE"], credential=cred) as sb:
+        async with sb.get_queue_sender("notification-tasks") as sender:
+            await sender.send_messages(ServiceBusMessage(json.dumps({
+                "type": "ProvisioningFailed",
+                "taskId": f"verify-{uuid.uuid4()}",
+                "identityId": "verify",
+                "instanceId": "verify",
+                "operationType": "grant",
+                "error": "verify.sh smoke test",
+                "occurredAt": "1970-01-01T00:00:00+00:00",
+            })))
+    await cred.close()
+
+asyncio.run(main())
+PY
+  ' > /dev/null 2>&1
+fi
+kubectl delete pod "$NOTIF_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+
+DRAINED=0
+for i in $(seq 1 12); do
+  ACTIVE=$(az servicebus queue show -g rg-iga-dev-data --namespace-name sb-iga-dev \
+    -n notification-tasks --query countDetails.activeMessageCount -o tsv 2>/dev/null || echo "?")
+  if [ "$ACTIVE" = "0" ]; then DRAINED=1; break; fi
+  sleep 5
+done
+if [ "$DRAINED" -eq 1 ]; then ok "notification-service drained the test message off notification-tasks"; else
+  bad "notification-tasks still has an unprocessed message after 60s — check: kubectl logs -n iga deploy/notification-service"
+fi
+
 echo "== Infra spot checks =="
 for Z in privatelink.documents.azure.com privatelink.vaultcore.azure.net; do
   N=$(az network private-dns record-set a list -g rg-iga-dev-network -z "$Z" --query "length(@)" -o tsv 2>/dev/null || echo 0)
@@ -233,6 +314,13 @@ DLQ=$(az servicebus queue show -g rg-iga-dev-data --namespace-name sb-iga-dev \
 if [ "$DLQ" = "0" ]; then ok "provisioning-tasks DLQ empty"; elif [ "$DLQ" = "?" ]; then
   bad "could not read Service Bus DLQ count"; else
   bad "provisioning-tasks DLQ has $DLQ message(s) — investigate before proceeding"
+fi
+
+NOTIF_DLQ=$(az servicebus queue show -g rg-iga-dev-data --namespace-name sb-iga-dev \
+  -n notification-tasks --query countDetails.deadLetterMessageCount -o tsv 2>/dev/null || echo "?")
+if [ "$NOTIF_DLQ" = "0" ]; then ok "notification-tasks DLQ empty"; elif [ "$NOTIF_DLQ" = "?" ]; then
+  bad "could not read notification-tasks Service Bus DLQ count"; else
+  bad "notification-tasks DLQ has $NOTIF_DLQ message(s) — investigate before proceeding"
 fi
 
 echo ""
