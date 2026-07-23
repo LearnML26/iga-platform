@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: [identity-service, provisioning-service, source-system-service, flatfile-connector-service, notification-service]
+        service: [identity-service, provisioning-service, source-system-service, flatfile-connector-service, notification-service, rbac-service]
     steps:
       - uses: actions/checkout@v4
       - name: Azure login (OIDC federated — configure AZURE_CLIENT_ID/TENANT_ID/SUBSCRIPTION_ID as repo variables)

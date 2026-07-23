@@ -331,6 +331,73 @@ PODYAML
   run_curl vrfy-jml-del -X DELETE "http://source-system-service/source-systems/${JML_SRC_ID}" > /dev/null
 fi
 
+# rbac-service (3.1): health, role CRUD + versioning, membership-rule
+# evaluation against $KEY (the "QA" department identity created earlier
+# in this script), and reconcile dispatching a provisioning task.
+OUT=$(run_curl vrfy-rbac-health http://rbac-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "rbac-service /healthz 200" || bad "rbac-service health failed: $OUT"
+
+RBAC_TOKEN=$(mint_token rbac-service)
+if [ -z "$RBAC_TOKEN" ]; then
+  bad "could not mint an rbac-service token — is the rbac.read/write app role assignment done? (roadmap/PHASES.md 3.1)"
+else
+  RBAC_HDR=(-H "Authorization: Bearer $RBAC_TOKEN")
+  RBAC_NAME="vrfy-role-$(date +%s)"
+
+  OUT=$(run_curl vrfy-rbac-noauth -X POST http://rbac-service/roles \
+    -H 'Content-Type: application/json' -d "{\"name\":\"$RBAC_NAME\"}")
+  echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "role create without token 401" || bad "expected 401 without token: $OUT"
+
+  OUT=$(run_curl vrfy-rbac-create -X POST http://rbac-service/roles "${RBAC_HDR[@]}" \
+    -H 'Content-Type: application/json' -d "{\"name\":\"$RBAC_NAME\",\"description\":\"verify probe\"}")
+  ROLE_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  echo "$OUT" | grep -q 'HTTP_STATUS:201' && echo "$OUT" | grep -q '"version":1' \
+    && ok "role create 201, version 1 ($RBAC_NAME)" || bad "role create failed: $OUT"
+
+  if [ -n "${ROLE_ID:-}" ]; then
+    OUT=$(run_curl vrfy-rbac-ent -X POST "http://rbac-service/roles/${ROLE_ID}/entitlements" "${RBAC_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d '{"targetSystemInstanceId":"verify-target","connectorType":"ad","entitlementRef":"CN=verify-group,DC=example,DC=com"}')
+    echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "role entitlement added" || bad "entitlement add failed: $OUT"
+
+    OUT=$(run_curl vrfy-rbac-getrole "${RBAC_HDR[@]}" "http://rbac-service/roles/${ROLE_ID}")
+    echo "$OUT" | grep -q '"version":2' && ok "role version bumped to 2 on entitlement add (REQ-COR-RBAC-007)" \
+      || bad "role version did not bump: $OUT"
+
+    OUT=$(run_curl vrfy-rbac-rule -X POST "http://rbac-service/roles/${ROLE_ID}/membership-rules" "${RBAC_HDR[@]}" \
+      -H 'Content-Type: application/json' -d '{"criteria":{"department":"QA"}}')
+    RULE_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "membership rule created (department=QA)" || bad "rule create failed: $OUT"
+
+    if [ -n "${RULE_ID:-}" ]; then
+      OUT=$(run_curl vrfy-rbac-eval -X POST \
+        "http://rbac-service/roles/${ROLE_ID}/membership-rules/${RULE_ID}/evaluate" "${RBAC_HDR[@]}")
+      echo "$OUT" | grep -q "\"$KEY\"" && ok "membership-rule evaluate matches \$KEY ($KEY) (REQ-COR-RBAC-008)" \
+        || bad "evaluate did not match $KEY: $OUT"
+    fi
+
+    OUT=$(run_curl vrfy-rbac-reconcile -X POST "http://rbac-service/roles/${ROLE_ID}/reconcile" "${RBAC_HDR[@]}")
+    echo "$OUT" | grep -q '"assignmentsAdded":1' && ok "reconcile added 1 rule-sourced assignment" \
+      || bad "reconcile unexpected result: $OUT"
+    echo "$OUT" | grep -q '"dispatchSucceeded"' && ok "reconcile dispatched a provisioning task (REQ-COR-RBAC-009)" \
+      || bad "reconcile did not report dispatch counts: $OUT"
+
+    OUT=$(run_curl vrfy-rbac-assignments "${RBAC_HDR[@]}" "http://rbac-service/roles/${ROLE_ID}/assignments?status=active")
+    ASSIGNMENT_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    echo "$OUT" | grep -q '"assignmentType":"rule"' && [ -n "${ASSIGNMENT_ID:-}" ] \
+      && ok "active rule-sourced assignment recorded" || bad "assignment list unexpected: $OUT"
+
+    if [ -n "${ASSIGNMENT_ID:-}" ]; then
+      OUT=$(run_curl vrfy-rbac-revoke -X DELETE \
+        "http://rbac-service/roles/${ROLE_ID}/assignments/${ASSIGNMENT_ID}" "${RBAC_HDR[@]}")
+      echo "$OUT" | grep -q '"status":"revoked"' && ok "assignment revoked, revoke dispatched" \
+        || bad "assignment revoke failed: $OUT"
+    fi
+
+    run_curl vrfy-rbac-del -X DELETE "http://rbac-service/roles/${ROLE_ID}" "${RBAC_HDR[@]}" > /dev/null
+  fi
+fi
+
 # notification-service (3.3): health + a real end-to-end queue smoke test.
 # It has no domain HTTP API of its own (pure Service Bus consumer + email/
 # webhook fan-out worker — see src/notification-service/app/main.py), so
