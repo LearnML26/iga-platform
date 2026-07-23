@@ -390,20 +390,23 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   1/1/1, round 3 0/0/1. Round 2's `recordsUpdated:1` (not the old buggy
   `2`) is the direct confirmation — a genuinely-unchanged identity now
   correctly produces zero updates.
-  One separate, unresolved item, not blocking: the smoke test's own
-  direct `GET /identities/by-correlation-key/{key}` checks (used only to
+  One separate item, since RESOLVED: the smoke test's own direct
+  `GET /identities/by-correlation-key/{key}` checks (used only to
   independently verify status, not part of the application's own
   add/update/terminate path) returned empty/no-response on every single
   attempt across 3 full runs, while flatfile-connector-service's internal
   calls to the same identity-service endpoint succeeded every time in the
-  same runs. Since a real permission problem would surface as a 403 with
-  a body rather than total silence, current best guess is a hang tied to
-  PyJWKClient's known blocking JWKS fetch on a cold per-replica cache
-  (flagged as a limitation in 1R.3) combined with curl having no
-  `--max-time` in the test harness — but this is unconfirmed, and worth
-  a closer look if it recurs. Doesn't affect the conclusion above: the
-  delta-summary numbers come from the application's own internal calls,
-  which is the authoritative evidence and was consistently correct.
+  same runs. The JWKS-cold-cache theory floated at the time was WRONG —
+  the real cause was embarrassingly mundane: the harness interpolated the
+  correlation key into the throwaway pod's name (`r23-get-E2001`), and
+  Kubernetes pod names must be lowercase RFC 1123 labels, so `kubectl run`
+  rejected the pod before curl ever executed — hence zero output, no
+  HTTP_STATUS line, and 100% consistency, while every all-lowercase pod
+  name in the same scripts (vrfy-search, diag-token, drv-*) worked fine.
+  Not an application issue at all. Fixed in smoketest.sh by lowercasing
+  the interpolated pod names; lesson recorded here: a `run_curl`-style
+  helper that builds pod names from data must sanitize them (lowercase,
+  and only [a-z0-9-]).
   Follow-up fix: a partial provisioning-dispatch failure (one target in a
   multi-target provisioningTargets list) used to be silently permanent —
   by the time the dispatch loop runs, the identity's correlationKey is

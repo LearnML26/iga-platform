@@ -168,7 +168,11 @@ fi
 # 5. confirm E2001/E2002/E2003 active
 declare -A IDENTITY_ID  # correlationKey -> identityId, reused in later rounds
 for KEY in E2001 E2002 E2003; do
-  OUT=$(run_curl "r23-get-$KEY" "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$KEY")
+  # Pod names must be lowercase (RFC 1123) — an uppercase key in the name
+  # makes `kubectl run` fail before curl ever executes, which surfaces as a
+  # completely empty $OUT with no HTTP_STATUS line (the "silent GET failure"
+  # seen on every earlier run of this script).
+  OUT=$(run_curl "r23-get-$(echo "$KEY" | tr '[:upper:]' '[:lower:]')" "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$KEY")
   if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"active"'; then
     ok "$KEY exists and is active"
   else
@@ -206,7 +210,7 @@ fi
 #    that nothing was dispatched for it — the errorSummary's apply tally
 #    covers this: 0 apply failures and no dispatch note, per ingest.py's
 #    _apply_terminations logging-only path for an empty provisioningTargets.
-OUT=$(run_curl r23-get-E2002-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2002")
+OUT=$(run_curl r23-get-e2002-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2002")
 if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"terminated"'; then
   ok "E2002 is now terminated"
 else
@@ -247,7 +251,7 @@ else
 fi
 
 # 11a. confirm E2003 terminated
-OUT=$(run_curl r23-get-E2003-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2003")
+OUT=$(run_curl r23-get-e2003-v2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/E2003")
 if echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status":"terminated"'; then
   ok "E2003 is now terminated"
 else
