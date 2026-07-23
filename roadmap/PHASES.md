@@ -549,10 +549,81 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
 
 ## Phase 3 — RBAC, requests, and the portals (spec §5.4, §5.7, §4)
 
-- [ ] **3.1 rbac-service** — REQ-COR-RBAC-001..004, 007..009. Role,
+- [x] **3.1 rbac-service** — REQ-COR-RBAC-001..004, 007..009. Role,
   RoleEntitlement, RoleMembershipRule, RoleAssignment, PlatformRole models in
   sqldb-rbac; versioning on change; membership-rule evaluation endpoint;
   assignment events → provisioning tasks.
+  DONE (scaffold, unverified in a live cluster — branch only, pending
+  review/deploy + two new [HUMAN] gates). No spec document was available
+  to this build (IGA_Platform_Requirements_Specification.docx isn't in
+  the repo) — the data model below is a reasonable, documented
+  interpretation of the REQ-COR-RBAC-001..004/007..009 summary text, not
+  a literal read of the spec. Flagging every place that's an assumption
+  rather than a spec fact, same discipline as 2.3's failure-threshold
+  scoping.
+  Data model (sqldb-rbac, SQLAlchemy async + aioodbc + Entra token auth,
+  exact source-system-service pattern): `Role` (named entitlement bundle,
+  versioned), `RoleEntitlement` (targetSystemInstanceId + connectorType +
+  entitlementRef — targetSystemInstanceId dual-purposes
+  source-system-service's registry as the target registry, same 2.3
+  precedent, since no separate one exists), `RoleMembershipRule` (JSON
+  equality criteria, ANDed within a rule), `RoleAssignment`
+  (rule/manual/request-sourced, active/revoked), `RoleVersion`
+  (append-only snapshot, mirrors identity-service's identity-history).
+  `PlatformRole` (IGA's own admin/operator roles — role-owner, certifier,
+  etc.) is CRUD-only: there's no existing mechanism to bind a PlatformRole
+  to a human operator's own token, so enforcement isn't implemented —
+  flagged in the model docstring as a real, undecided gap, not silently
+  assumed away.
+  Versioning (007): `Role.version` bumps on any change to the role's own
+  fields OR its entitlement list (both change what the role grants);
+  each bump appends a full `RoleVersion` snapshot. `GET /roles/{id}/versions`
+  lists history.
+  Evaluation (008): `POST /roles/{id}/membership-rules/{ruleId}/evaluate`
+  is a pure dry run — reports matching identityIds, changes nothing.
+  Criteria are simple key-equality; only `department` is pushed down as
+  identity-service's server-side filter (the only attribute filter
+  search_identities has beyond status/manager/q/terminationDateBefore) —
+  every other criterion key is applied client-side against the fetched
+  records. Deliberate v1 scoping to avoid another identity-service
+  query-surface change in this pass; noted as O(active-identities-in-
+  department), fine at dev scale.
+  Assignment → provisioning (009): `POST /roles/{id}/reconcile` evaluates
+  every enabled rule (ORed across rules), creates RoleAssignments for
+  newly-matching identities, revokes rule-sourced assignments for
+  identities no longer matched by any rule, and dispatches a grant/revoke
+  task per RoleEntitlement for every assignment created/revoked. Manual
+  assignment (`POST .../assignments`) and revocation (`DELETE
+  .../assignments/{id}`) dispatch the same way; reconcile never touches
+  manual assignments. Dispatch here is best-effort (logged + counted on
+  failure, not retried) — it does NOT reuse 2.3's
+  pendingProvisioningDispatch persistence-and-retry mechanism, which
+  lives in flatfile-connector-service. That's a real gap for a v-next
+  pass (a partial dispatch failure here IS silently lost, the exact bug
+  2.3 fixed for the ingest path), called out rather than left implicit.
+  Auth: same posture as identity-service/provisioning-service (1R.3) —
+  every endpoint but health probes requires a validated iga-platform-api
+  token with rbac.read or rbac.write. New [HUMAN] gates, printed by
+  deploy.sh: (1) rbac.read/rbac.write don't exist as app roles yet —
+  defining a new app role on the existing iga-platform-api registration
+  is a Graph app update requiring directory perms; (2) once defined,
+  grant rbac-service's managed identity all four roles it needs
+  (rbac.read, rbac.write, identities.read to evaluate rules,
+  provisioning.write to dispatch) — same appRoleAssignment pattern as
+  2.3's flatfile-connector-service gate. Until both land, rbac-service's
+  own endpoints 401 and its outbound calls 403 (correctly, not silently).
+  Plus the usual [ONE-TIME, HUMAN] SQL grant for sqldb-rbac, same pattern
+  as source-system-service's.
+  Wiring: k8s/services/rbac-service.yaml (Deployment + migrate Job +
+  Service + HPA, exact source-system-service shape), deploy.sh (SVC
+  loops, SQL grant, both new gates above), CI matrix, verify.sh (health,
+  401-without-token, role create + version-bump-on-entitlement-add,
+  membership-rule evaluate matching the identity-service check's own
+  $KEY/QA-department identity, reconcile + dispatch, assignment
+  list + revoke). ruff clean, all files compile. Not run: no live
+  cluster access from this session, and the two new [HUMAN] gates above
+  block even a clean deploy from being functionally complete until
+  granted — deploy + gates + verify.sh is the next human step.
 - [ ] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via

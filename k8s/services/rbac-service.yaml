@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbac-service
+  namespace: iga
+  annotations:
+    azure.workload.identity/client-id: "${RBAC_SVC_CLIENT_ID}"
+---
+# One-shot Alembic migration, applied before the Deployment rolls out.
+# Re-run safe: alembic upgrade head is a no-op once the DB is at head.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rbac-service-migrate
+  namespace: iga
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: rbac-service-migrate
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: rbac-service
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ${ACR_LOGIN_SERVER}/rbac-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - { name: SQL_SERVER,   value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE, value: "sqldb-rbac" }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbac-service
+  namespace: iga
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: rbac-service }
+  template:
+    metadata:
+      labels:
+        app: rbac-service
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: rbac-service
+      containers:
+        - name: rbac-service
+          image: ${ACR_LOGIN_SERVER}/rbac-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: SQL_SERVER,   value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE, value: "sqldb-rbac" }
+            - { name: IDENTITY_SERVICE_URL, value: "http://identity-service" }
+            - { name: PROVISIONING_SERVICE_URL, value: "http://provisioning-service" }
+            - { name: ENTRA_TENANT_ID, value: "${ENTRA_TENANT_ID}" }
+            - { name: API_AUDIENCE, value: "${API_AUDIENCE}" }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rbac-service
+  namespace: iga
+spec:
+  selector: { app: rbac-service }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rbac-service
+  namespace: iga
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: rbac-service }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
