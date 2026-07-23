@@ -42,6 +42,7 @@ class SourceSystemInstanceIn(BaseModel):
     status: str = "active"
     config: dict[str, Any] = Field(default_factory=dict)
     provisioningTargets: list[str] = Field(default_factory=list)
+    ownerIdentityId: Optional[str] = None
 
 
 class SourceSystemInstanceOut(SourceSystemInstanceIn):

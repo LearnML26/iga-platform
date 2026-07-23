@@ -403,13 +403,99 @@ else
   fi
 fi
 
-# The reconcile/revoke dispatches just above queue real connectorType:"ad"
-# tasks that cannot succeed — there's no real AD/LDAPS server for this dev
-# cluster to bind to (confirmed, not just "not yet wired"), so they will
-# dead-letter on their own schedule regardless of when this script runs.
-# Self-drain here rather than requiring a manual pre-step before every
-# verify.sh run; this only removes already-dead-lettered messages, never
-# the live queue.
+# access-request-service (3.2): health, 401, a resolvable-manager /
+# skipped-owner approval chain through to dispatch, and the
+# both-steps-unresolvable auto-approve path. Reuses $AUTH_HDR (minted
+# above for identity-service) to create the manager/requester identities.
+OUT=$(run_curl vrfy-ar-health http://access-request-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "access-request-service /healthz 200" || bad "access-request-service health failed: $OUT"
+
+AR_TOKEN=$(mint_token access-request-service)
+if [ -z "$AR_TOKEN" ]; then
+  bad "could not mint an access-request-service token — is the requests.read/write app role assignment done? (roadmap/PHASES.md 3.2)"
+else
+  AR_HDR=(-H "Authorization: Bearer $AR_TOKEN")
+  AR_TS=$(date +%s)
+
+  OUT=$(run_curl vrfy-ar-noauth -X POST http://access-request-service/requests \
+    -H 'Content-Type: application/json' -d '{"requesterIdentityId":"x","lineItems":[]}')
+  echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "request create without token 401" || bad "expected 401 without token: $OUT"
+
+  OUT=$(run_curl vrfy-ar-mgr -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"correlationKey\":\"ARMGR${AR_TS}\",\"displayName\":\"Verify Manager\"}")
+  MGR_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+  OUT=$(run_curl vrfy-ar-req-identity -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"correlationKey\":\"ARREQ${AR_TS}\",\"displayName\":\"Verify Requester\",\"managerIdentityId\":\"$MGR_ID\"}")
+  REQUESTER_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+  # No ownerIdentityId set on this source system -> owner step skips,
+  # leaving only the manager step to decide.
+  OUT=$(run_curl vrfy-ar-src -X POST http://source-system-service/source-systems \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"vrfy-ar-src-${AR_TS}\",\"connectorType\":\"ad\"}")
+  AR_SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+  if [ -n "${MGR_ID:-}" ] && [ -n "${REQUESTER_ID:-}" ] && [ -n "${AR_SRC_ID:-}" ]; then
+    OUT=$(run_curl vrfy-ar-create -X POST http://access-request-service/requests "${AR_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"requesterIdentityId\":\"$REQUESTER_ID\",\"lineItems\":[{\"targetSystemInstanceId\":\"$AR_SRC_ID\",\"connectorType\":\"ad\",\"entitlementRef\":\"CN=verify-request-group,DC=example,DC=com\"}]}")
+    echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "request create 201 (1 line item, manager chain)" || bad "request create failed: $OUT"
+    echo "$OUT" | grep -q '"stepType":"manager"' && echo "$OUT" | grep -q '"stepType":"owner"' \
+      && echo "$OUT" | grep -q '"status":"skipped"' \
+      && ok "approval chain built: manager pending, owner skipped (no ownerIdentityId set)" \
+      || bad "approval chain unexpected: $OUT"
+    REQ_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '1p' | cut -d'"' -f4)
+    LI_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '2p' | cut -d'"' -f4)
+    STEP_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '3p' | cut -d'"' -f4)
+
+    if [ -n "${REQ_ID:-}" ] && [ -n "${LI_ID:-}" ] && [ -n "${STEP_ID:-}" ]; then
+      OUT=$(run_curl vrfy-ar-decide -X POST \
+        "http://access-request-service/requests/${REQ_ID}/line-items/${LI_ID}/approval-steps/${STEP_ID}/decide" \
+        "${AR_HDR[@]}" -H 'Content-Type: application/json' \
+        -d "{\"decision\":\"approve\",\"decidedByIdentityId\":\"$MGR_ID\"}")
+      echo "$OUT" | grep -q '"status":"approved"' && ok "manager step approved" || bad "step decision failed: $OUT"
+
+      OUT=$(run_curl vrfy-ar-get "${AR_HDR[@]}" "http://access-request-service/requests/${REQ_ID}")
+      echo "$OUT" | grep -q '"status":"dispatched"' && ok "line item dispatched on final approval (REQ-COR-REQ-009)" \
+        || bad "line item did not dispatch: $OUT"
+      echo "$OUT" | grep -q '"status":"completed"' && ok "request completed once its only line item is terminal" \
+        || bad "request did not complete: $OUT"
+    else
+      bad "access-request-service: could not capture request/line-item/step ids — skipped decision check"
+    fi
+  else
+    bad "access-request-service: manager/requester/source-system setup failed — skipped request test"
+  fi
+
+  # Requester has no manager, target has no owner: both steps unresolvable
+  # -> auto-approve immediately, no human gate needed at all.
+  OUT=$(run_curl vrfy-ar-nomgr -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"correlationKey\":\"ARNOMGR${AR_TS}\",\"displayName\":\"Verify No Manager\"}")
+  NOMGR_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+  if [ -n "${NOMGR_ID:-}" ] && [ -n "${AR_SRC_ID:-}" ]; then
+    OUT=$(run_curl vrfy-ar-auto -X POST http://access-request-service/requests "${AR_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"requesterIdentityId\":\"$NOMGR_ID\",\"lineItems\":[{\"targetSystemInstanceId\":\"$AR_SRC_ID\",\"connectorType\":\"ad\",\"entitlementRef\":\"CN=verify-request-group,DC=example,DC=com\"}]}")
+    echo "$OUT" | grep -q '"status":"dispatched"' && echo "$OUT" | grep -q '"status":"completed"' \
+      && ok "unresolvable chain (no manager, no owner) auto-approved and dispatched" \
+      || bad "auto-approve path unexpected: $OUT"
+  else
+    bad "access-request-service: no-manager setup failed — skipped auto-approve check"
+  fi
+fi
+
+# The rbac-service and access-request-service dispatches just above queue
+# real connectorType:"ad" tasks that cannot succeed — there's no real
+# AD/LDAPS server for this dev cluster to bind to (confirmed, not just "not
+# yet wired"), so they will dead-letter on their own schedule regardless of
+# when this script runs. Self-drain here rather than requiring a manual
+# pre-step before every verify.sh run; this only removes already-dead-
+# lettered messages, never the live queue.
 "$(dirname "$0")/drain-provisioning-dlq.sh" > /dev/null 2>&1
 
 # notification-service (3.3): health + a real end-to-end queue smoke test.

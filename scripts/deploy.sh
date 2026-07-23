@@ -51,7 +51,7 @@ kubelogin convert-kubeconfig -l azurecli
 OIDC_ISSUER=$(az aks show -g "$RG_COMPUTE" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 
 declare -A SVC_CLIENT_IDS
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service; do
   MI_NAME="mi-${SUFFIX}-${SVC}"
   az identity create -g "$RG_COMPUTE" -n "$MI_NAME" -l "$LOCATION" -o none
   CLIENT_ID=$(az identity show -g "$RG_COMPUTE" -n "$MI_NAME" --query clientId -o tsv)
@@ -100,8 +100,16 @@ az role assignment create --assignee "$NOTIF_PRINCIPAL" \
   --role "Azure Service Bus Data Receiver" \
   --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
 
+# Service Bus Data Sender for access-request-service (Phase 3.2) — it only
+# publishes onto 'notification-tasks' (ApprovalRequested/RequestDecided),
+# never consumes, so Sender is least-privilege here.
+AR_PRINCIPAL=$(az identity show -g "$RG_COMPUTE" -n "mi-${SUFFIX}-access-request-service" --query principalId -o tsv)
+az role assignment create --assignee "$AR_PRINCIPAL" \
+  --role "Azure Service Bus Data Sender" \
+  --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
+
 echo "==> [4/5] Building and pushing images (ACR server-side build — no local Docker needed)"
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service; do
   # az acr build uploads the context, builds in ACR, and pushes the image
   # to ${ACR_LOGIN_SERVER}/${SVC}:${IMAGE_TAG} automatically on success.
   az acr build \
@@ -122,6 +130,7 @@ export SOURCE_SYSTEM_SVC_CLIENT_ID="${SVC_CLIENT_IDS[source-system-service]}"
 export FLATFILE_CONNECTOR_SVC_CLIENT_ID="${SVC_CLIENT_IDS[flatfile-connector-service]}"
 export NOTIFICATION_SVC_CLIENT_ID="${SVC_CLIENT_IDS[notification-service]}"
 export RBAC_SVC_CLIENT_ID="${SVC_CLIENT_IDS[rbac-service]}"
+export ACCESS_REQUEST_SVC_CLIENT_ID="${SVC_CLIENT_IDS[access-request-service]}"
 export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
 export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
 export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv)"
@@ -132,7 +141,7 @@ export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --qu
 # recreated cleanly. (1R.7: this bit source-system-service once already;
 # rbac-service needs the identical treatment, hence the loop rather than
 # duplicating the block per service.)
-SQL_MIGRATE_SERVICES=(source-system-service rbac-service)
+SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service)
 for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
   kubectl delete "job/${SVC}-migrate" -n iga --ignore-not-found
 done
@@ -220,3 +229,37 @@ echo "          --body \"{\\\"principalId\\\":\\\"\$RBAC_SP_ID\\\",\\\"resourceI
 echo "      done"
 echo "    Until both steps are done, rbac-service's own endpoints 401 (no rbac.read/rbac.write role exists to"
 echo "    grant yet) and its calls to identity-service/provisioning-service 403."
+echo "  - [ONE-TIME, HUMAN] Grant access-request-service's managed identity access to sqldb-accessrequest (same"
+echo "    pattern as source-system-service/rbac-service above — sql-${SUFFIX} is VNet-only, run from inside it as"
+echo "    an iga-platform-admins member):"
+echo "      CREATE USER [mi-${SUFFIX}-access-request-service] FROM EXTERNAL PROVIDER;"
+echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-access-request-service];"
+echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-access-request-service];"
+echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-access-request-service];  -- needed for Alembic's CREATE TABLE"
+echo "  - [HUMAN gate, Phase 3.2] access-request-service needs two NEW iga-platform-api app roles that don't exist"
+echo "    yet (requests.read, requests.write) — same Graph app-update pattern as 3.1's rbac.read/rbac.write. Run:"
+echo "      API_APP_ID=\$(az ad app list --display-name iga-platform-api --query '[0].id' -o tsv)"
+echo "      CUR_ROLES=\$(az ad app show --id \"\$API_APP_ID\" --query appRoles -o json)"
+echo "      NEW_ROLES=\$(python3 -c \""
+echo "import json,sys,uuid"
+echo "roles = json.loads(sys.argv[1])"
+echo "for v in ('requests.read', 'requests.write'):"
+echo "    if not any(r['value'] == v for r in roles):"
+echo "        roles.append({'id': str(uuid.uuid4()), 'allowedMemberTypes': ['Application'],"
+echo "                      'displayName': v, 'value': v, 'description': v, 'isEnabled': True})"
+echo "print(json.dumps(roles))"
+echo "\" \"\$CUR_ROLES\")"
+echo "      az ad app update --id \"\$API_APP_ID\" --app-roles \"\$NEW_ROLES\""
+echo "    Then grant access-request-service's managed identity all four roles it needs (requests.read/requests.write"
+echo "    for its own endpoints, identities.read to resolve the requester's manager, provisioning.write to dispatch"
+echo "    grant tasks on final approval) — same appRoleAssignment pattern as rbac-service above:"
+echo "      API_SP_ID=\$(az ad sp list --filter \"displayName eq 'iga-platform-api'\" --query '[0].id' -o tsv)"
+echo "      AR_SP_ID=\$(az ad sp list --filter \"displayName eq 'mi-${SUFFIX}-access-request-service'\" --query '[0].id' -o tsv)"
+echo "      for ROLE in requests.read requests.write identities.read provisioning.write; do"
+echo "        ROLE_ID=\$(az ad sp show --id \"\$API_SP_ID\" --query \"appRoles[?value=='\$ROLE'].id | [0]\" -o tsv)"
+echo "        az rest --method POST --uri \"https://graph.microsoft.com/v1.0/servicePrincipals/\$AR_SP_ID/appRoleAssignments\" \\"
+echo "          --body \"{\\\"principalId\\\":\\\"\$AR_SP_ID\\\",\\\"resourceId\\\":\\\"\$API_SP_ID\\\",\\\"appRoleId\\\":\\\"\$ROLE_ID\\\"}\""
+echo "      done"
+echo "    Until both steps are done, access-request-service's own endpoints 401 and its calls to"
+echo "    identity-service/provisioning-service 403. It also calls source-system-service, which has no auth wired"
+echo "    at all (a pre-existing gap, not introduced here) — no gate needed for that call."

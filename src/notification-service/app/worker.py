@@ -88,9 +88,88 @@ async def _handle_provisioning_failed(raw: dict[str, Any]) -> None:
         raise failures[0]
 
 
+# Phase 3.2 (access-request-service) event shapes. Neither identity-service
+# nor this service has any notion of a per-identity email address (checked —
+# no such field exists), and NOTIFY_EMAIL_TO/NOTIFY_WEBHOOK_URLS are a single
+# static ops-distro recipient list, not per-identity routing — same posture
+# as ProvisioningFailed above. So these do NOT email the actual approver;
+# they land in the same static inbox with the approver's/requester's
+# identityId in the body. True per-person delivery needs a real identity ->
+# email mapping and is a documented gap, not silently pretended away.
+class ApprovalRequestedEvent(BaseModel):
+    type: str = "ApprovalRequested"
+    requestId: str
+    lineItemId: str
+    approvalStepId: str
+    stepType: str
+    approverIdentityId: str
+    requesterIdentityId: str
+    targetSystemInstanceId: str
+    entitlementRef: str
+    occurredAt: str
+
+
+async def _handle_approval_requested(raw: dict[str, Any]) -> None:
+    event = ApprovalRequestedEvent(**raw)
+    subject = f"[IGA] Approval needed: request {event.requestId}"
+    body = (
+        f"An access request needs a {event.stepType} decision.\n\n"
+        f"requestId:      {event.requestId}\n"
+        f"lineItemId:     {event.lineItemId}\n"
+        f"approverIdentityId:  {event.approverIdentityId}\n"
+        f"requesterIdentityId: {event.requesterIdentityId}\n"
+        f"targetSystemInstanceId: {event.targetSystemInstanceId}\n"
+        f"entitlementRef: {event.entitlementRef}\n"
+        f"occurredAt:     {event.occurredAt}\n"
+    )
+    results = await asyncio.gather(
+        send_email(subject, body),
+        fan_out_webhooks(event.model_dump()),
+        return_exceptions=True,
+    )
+    failures = [r for r in results if isinstance(r, Exception)]
+    if len(failures) == len(results):
+        raise failures[0]
+
+
+class RequestDecidedEvent(BaseModel):
+    type: str = "RequestDecided"
+    requestId: str
+    lineItemId: str
+    requesterIdentityId: str
+    decision: str  # approved | rejected
+    targetSystemInstanceId: str
+    entitlementRef: str
+    occurredAt: str
+
+
+async def _handle_request_decided(raw: dict[str, Any]) -> None:
+    event = RequestDecidedEvent(**raw)
+    subject = f"[IGA] Request {event.decision}: {event.requestId}"
+    body = (
+        f"Access request line item {event.decision}.\n\n"
+        f"requestId:      {event.requestId}\n"
+        f"lineItemId:     {event.lineItemId}\n"
+        f"requesterIdentityId: {event.requesterIdentityId}\n"
+        f"targetSystemInstanceId: {event.targetSystemInstanceId}\n"
+        f"entitlementRef: {event.entitlementRef}\n"
+        f"occurredAt:     {event.occurredAt}\n"
+    )
+    results = await asyncio.gather(
+        send_email(subject, body),
+        fan_out_webhooks(event.model_dump()),
+        return_exceptions=True,
+    )
+    failures = [r for r in results if isinstance(r, Exception)]
+    if len(failures) == len(results):
+        raise failures[0]
+
+
 # type discriminator -> handler
 _HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[None]]] = {
     "ProvisioningFailed": _handle_provisioning_failed,
+    "ApprovalRequested": _handle_approval_requested,
+    "RequestDecided": _handle_request_decided,
 }
 
 

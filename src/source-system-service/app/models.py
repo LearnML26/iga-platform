@@ -34,6 +34,11 @@ class SourceSystemInstance(Base):
     # default: an instance must opt in explicitly, nothing is wired
     # automatically off connectorType.
     provisioningTargets: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Who administers/approves access to this target system (3.2's
+    # "manager -> owner" default approval chain resolves the owner step from
+    # here). Optional: an instance with no owner set just skips that step
+    # rather than blocking a request forever.
+    ownerIdentityId: Mapped[str | None] = mapped_column(String(36), nullable=True)
     createdDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     lastModifiedDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 

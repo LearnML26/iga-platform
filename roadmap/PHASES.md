@@ -661,10 +661,86 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   calls scripts/drain-provisioning-dlq.sh on itself right after the rbac
   block (self-cleans prior runs' accumulated dead letters) rather than
   requiring that as a manual pre-step every time.
-- [ ] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
+- [x] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via
   notification queue; approval → provisioning task.
+  DONE, scaffold — same "no spec document, decisions flagged as
+  interpretation not fact" discipline as 3.1 (IGA_Platform_Requirements_
+  Specification.docx still isn't in the repo). Not yet live-verified: no
+  cluster access from this session, and a new [HUMAN] gate (below) blocks
+  a clean deploy the same way 3.1's did.
+  Data model (sqldb-accessrequest, identical SQLAlchemy async + aioodbc +
+  Entra token auth pattern as source-system-service/rbac-service):
+  `Request` (self-service only in v1 — no on-behalf-of/delegated
+  requesting; there's no per-user auth yet to attribute a delegated
+  request to a real actor), `LineItem` (one requested entitlement;
+  targetSystemInstanceId + connectorType + entitlementRef — deliberately
+  mirrors rbac-service's RoleEntitlement shape rather than referencing one
+  by id, the same "target-system-instance registry doubles as the
+  requestable-item registry" precedent from 2.3/3.1), `ApprovalStep`
+  (built once at request creation, ordered).
+  Real, documented gap: an approved LineItem does NOT create a
+  rbac-service RoleAssignment, even though `RoleAssignment.assignmentType`
+  already reserves a `'request'` value for exactly this. Wiring it would
+  require deciding whether requests target raw entitlements or whole
+  Roles, which nothing in the 3.2 summary specifies — left for a v-next
+  pass rather than guessed at.
+  Approval chain ("manager → owner", REQ-COR-REQ-006): manager is resolved
+  from the requester's own identity-service record (`managerIdentityId`,
+  already existed). owner is resolved from the line item's target system
+  instance — source-system-service had no such concept at all, so this
+  pass adds `ownerIdentityId` (nullable, additive migration 0003) to
+  `SourceSystemInstance`, exactly like 2.3 added `provisioningTargets`.
+  Either step is skipped immediately if its identity can't be resolved
+  (never blocks); if BOTH skip, the line item auto-approves with no human
+  gate at all. There's no "fallback approver" concept anywhere in this
+  codebase to fall back to instead — "skip" is the least-invented default,
+  flagged rather than silently assumed to match whatever "with fallback"
+  in 4.3's similar wording actually means.
+  Dispatch on final approval (REQ-COR-REQ-009): one grant task per
+  approved line item to provisioning-service, `sourceType: "access-
+  request"` — the exact literal already named in provisioning-service's
+  own `ProvisioningTask.sourceType` docstring before this pass existed.
+  Best-effort (logged + counted on failure, not retried) — same posture
+  and same reasoning as rbac-service's dispatch, does not duplicate 2.3's
+  pendingProvisioningDispatch retry mechanism.
+  Notifications: publishes `ApprovalRequested` (to the current step's
+  approver) and `RequestDecided` (to the requester) onto the
+  `notification-tasks` queue — both new event types added to
+  notification-service's `_HANDLERS` (its worker.py had already
+  anticipated this exact producer and event-type-discriminator extension
+  point by name, before this pass existed). Neither identity-service nor
+  notification-service has any per-identity email address concept
+  (checked) and notification-service's sender config is a single static
+  ops-distro recipient list, not per-identity routing — so these land in
+  that same static inbox with the relevant identityId in the body, not the
+  approver's/requester's actual inbox. Real per-person delivery needs an
+  identity → email mapping that doesn't exist yet; a documented gap, not a
+  pretended capability.
+  Auth: same posture as identity-service/provisioning-service/rbac-service
+  (1R.3) — requests.read/requests.write are new app roles, another
+  [HUMAN] gate printed by deploy.sh (same appRoleAssignment pattern as
+  3.1's rbac.read/rbac.write). Deciding an approval step is gated on
+  requests.write only — there is no per-user token/identity verification
+  anywhere in this codebase yet (that's 3.4's SPA/MSAL work, still ahead)
+  to cryptographically confirm the caller IS the resolved
+  approverIdentityId. Same class of gap as PlatformRole's unenforced
+  binding in 3.1, flagged rather than silently assumed safe. Calls to
+  source-system-service need no token — that service has no auth wired at
+  all, a pre-existing gap that predates 1R.3, not introduced here.
+  Wiring: k8s/services/access-request-service.yaml (Deployment + migrate
+  Job + Service + HPA, same shape as rbac-service's), deploy.sh (SVC
+  loops, Service Bus Data Sender role assignment for publishing to
+  notification-tasks, SQL grant, both new gates above), CI matrix,
+  verify.sh (health, 401-without-token, a resolvable-manager/skipped-owner
+  chain through decide → dispatch → request completion, and the
+  both-steps-unresolvable auto-approve path). verify.sh's own dispatch
+  from this test queues another "ad"-connector task that can't succeed for
+  the same reason as rbac-service's (no real AD server) — covered by the
+  same self-drain call, just moved to run after both dispatch-generating
+  blocks instead of only after rbac-service's. ruff clean, all files
+  compile.
 - [x] **3.3 notification-service** — consumes notification-tasks queue,
   sends email via ACS Email or SMTP relay [HUMAN gate: provide sender config
   as Key Vault secrets]. Webhook fan-out for ProvisioningFailed.
