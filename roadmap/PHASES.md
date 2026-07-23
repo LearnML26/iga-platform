@@ -526,14 +526,17 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   identities already in the dev cluster from smoke-test runs
   (correlationKey is global, no delete endpoint), which would have
   corrupted the demo's add/update counts.
-  Remaining (human-in-the-loop, after 2.4 deploys): regenerate fixtures
-  for live dates (python3 fixtures/jml-demo/generate_fixtures.py — the
-  whole fixture is date-relative and committed copies go stale
-  immediately), then run the README's demo sequence: baseline ingest
-  (50 added, J1046–J1050 pending-start), sweep (3 near-window joiners
-  activate, +7/+14 stay pending), round 2 (5 updated / 2 terminated),
-  and on the scheduled dates confirm the sweep terminates + dispatches
-  disable-account per provisioningTargets.
+  Remaining (human-in-the-loop, after 2.4 deploys): run
+  scripts/jml-demo.sh — it regenerates the fixtures for live dates
+  (mandatory: the whole fixture is date-relative and committed copies go
+  stale immediately), then runs and asserts the full day-0 sequence:
+  baseline ingest (50 added, J1046–J1050 pending-start), sweep (the
+  +1/+2/+3-day joiners activate, +7/+14 stay pending), round 2 (5
+  updated / 2 immediate terminations with disable-account dispatch to
+  "ad"). The two scheduled terminations then land on their effective
+  dates via the daily CronJob — confirm those by-correlation-key on/after
+  each date, and run scripts/drain-provisioning-dlq.sh after dispatches
+  dead-letter (AD creds unwired) so verify.sh's DLQ gate stays green.
 
 ## Phase 3 — RBAC, requests, and the portals (spec §5.4, §5.7, §4)
 

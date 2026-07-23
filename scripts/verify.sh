@@ -177,9 +177,17 @@ OUT=$(run_curl vrfy-ffc-src-create -X POST http://source-system-service/source-s
 FFC_SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 
 if [ -n "${FFC_SRC_ID:-}" ]; then
+  # Since 2.3, ingest creates real identities: the fixture needs a
+  # displayName mapping (required field, 422 without it) and unique
+  # per-run keys (correlationKey is global — fixed V1/V2 keys would exist
+  # after the first run and report updates instead of adds forever).
+  FFC_TS=$(date +%s)
   run_curl vrfy-ffc-mapping -X POST "http://source-system-service/source-systems/${FFC_SRC_ID}/mappings" \
     -H 'Content-Type: application/json' \
     -d '{"sourceAttribute":"emp_id","targetAttribute":"correlationKey","isKey":true}' > /dev/null
+  run_curl vrfy-ffc-mapping2 -X POST "http://source-system-service/source-systems/${FFC_SRC_ID}/mappings" \
+    -H 'Content-Type: application/json' \
+    -d '{"sourceAttribute":"name","targetAttribute":"displayName","isKey":false}' > /dev/null
 
   FFC_POD="vrfy-ffc-upload"
   kubectl delete pod "$FFC_POD" -n $NS --ignore-not-found > /dev/null 2>&1
@@ -199,10 +207,10 @@ spec:
       command: ["sleep", "90"]
 PODYAML
   if kubectl wait --for=condition=Ready "pod/$FFC_POD" -n $NS --timeout=60s > /dev/null 2>&1; then
-    kubectl exec -n $NS "$FFC_POD" -- bash -c '
+    kubectl exec -n $NS "$FFC_POD" -- env FFC_TS="$FFC_TS" bash -c '
       az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" \
         --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" -o none 2>/dev/null
-      printf "emp_id,name\nV1,Alice\nV2,Bob\n" > /tmp/f.csv
+      printf "emp_id,name\nVF${FFC_TS}A,Alice\nVF${FFC_TS}B,Bob\n" > /tmp/f.csv
       md5sum /tmp/f.csv | cut -d" " -f1 | tr -d "\n" > /tmp/f.csv.md5
       az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/f.csv -n verify/ffc-fixture.csv --overwrite -o none
       az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/f.csv.md5 -n verify/ffc-fixture.csv.md5 --overwrite -o none
