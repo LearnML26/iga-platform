@@ -500,8 +500,17 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   unauthenticated, same posture as /ingest; retry pass remains blind to
   current provisioningTargets (documented 2.3 behavior, unchanged).
   verify.sh gained the pending-start + sweep assertions as part of the 2.5
-  fixture below. Not run: no live cluster access from this session —
-  deploy + verify.sh is the next human step.
+  fixture below.
+  Live-verified: deployed and verify.sh passed clean, all six new
+  JML/lifecycle assertions green — future-dated joiner created
+  pending-start, transfer/leaver behave as before, sweep runs without
+  activating a joiner outside the pre-start window. (Along the way,
+  verify.sh's pre-existing flat-file check turned out to be broken by 2.3
+  — missing displayName mapping + fixed reused keys — and
+  scripts/drain-provisioning-dlq.sh needed a fix of its own: its
+  azure-cli-image + runtime `pip install` was failing silently, switched
+  to provisioning-service's own image which already has the needed
+  packages. Both fixed, both on main.)
 - [ ] **2.5 End-to-end JML demo** — Synthetic 50-row HR CSV: joiners create
   identities, a transfer row changes attributes, a leaver row terminates and
   generates a disable-account provisioning task. verify.sh gains a pipeline
