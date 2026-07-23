@@ -94,7 +94,7 @@ import io
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -132,6 +132,20 @@ class IngestError(Exception):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    """Best-effort ISO date parse for mapped date attributes. Accepts a bare
+    YYYY-MM-DD or a full ISO timestamp (takes the date part). Returns None
+    for anything unparseable — callers treat that as "no date", never as an
+    error: date columns come from arbitrary source CSVs and a malformed
+    value must not fail lifecycle logic (REQ-COR-SRC-007/008)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
 
 
 async def _verify_checksum(container_client, blob_path: str, content: bytes) -> Optional[str]:
@@ -239,15 +253,56 @@ async def _call(coro) -> tuple[Optional[httpx.Response], Optional[str]]:
         return None, f"{type(e).__name__}: {e}"
 
 
-def _disable_account_task(feed_run_id: str, instance_id: str, identity_id: str, key: str, connector_type: str) -> dict:
+def _disable_account_task(source_ref: str, instance_id: str, identity_id: str, key: str, connector_type: str) -> dict:
     return {
         "sourceType": "source-feed",
-        "sourceRef": feed_run_id,
+        "sourceRef": source_ref,
         "identityId": identity_id,
         "instanceId": instance_id,
         "connectorType": connector_type,
         "operationType": "disable-account",
         "payload": {"correlationKey": key},
+    }
+
+
+async def _dispatch_disable_accounts(
+    provisioning_http: httpx.AsyncClient,
+    source_ref: str,
+    instance_id: str,
+    identity_id: str,
+    key: str,
+    targets: list[str],
+    failure_budget: Optional[int] = None,
+) -> dict[str, Any]:
+    """POST one disable-account task per target connector — the single
+    dispatch loop shared by the ingest termination pass, the
+    pending-dispatch retry pass, and the lifecycle sweep (2.4), so task
+    shape and failure accounting can't drift between the three callers.
+    Returns: `succeeded` (targets that got a 202), `failedTargets`
+    (attempted failures PLUS any never attempted once failure_budget ran
+    out — the full set a caller must persist for retry), `attemptedFailures`
+    (only POSTs that actually failed, for threshold accounting), and
+    `haltReason` when the budget was exhausted."""
+    succeeded: list[str] = []
+    failed_targets: list[str] = []
+    attempted_failures = 0
+    halt_reason: Optional[str] = None
+    for ti, connector_type in enumerate(targets):
+        resp, err = await _call(provisioning_http.post(
+            "/tasks", json=_disable_account_task(source_ref, instance_id, identity_id, key, connector_type)
+        ))
+        if err or resp.status_code != 202:
+            attempted_failures += 1
+            failed_targets.append(connector_type)
+            if failure_budget is not None and attempted_failures >= failure_budget:
+                halt_reason = err or f"POST /tasks (disable-account, {connector_type}) returned {resp.status_code}"
+                failed_targets.extend(targets[ti + 1:])
+                break
+        else:
+            succeeded.append(connector_type)
+    return {
+        "succeeded": succeeded, "failedTargets": failed_targets,
+        "attemptedFailures": attempted_failures, "haltReason": halt_reason,
     }
 
 
@@ -290,25 +345,17 @@ async def _retry_pending_dispatches(
             continue
         existing = resp.json()
 
-        still_failing: list[str] = []
-        for ti in range(len(targets)):
-            connector_type = targets[ti]
-            attempted += 1
-            resp2, err2 = await _call(provisioning_http.post(
-                "/tasks", json=_disable_account_task(feed_run_id, instance_id, existing["identityId"], key, connector_type)
-            ))
-            if err2 or resp2.status_code != 202:
-                failed += 1
-                still_failing.append(connector_type)
-                if failed >= threshold:
-                    halted = True
-                    halt_reason = err2 or f"POST /tasks (disable-account retry, {connector_type}) returned {resp2.status_code}"
-                    still_failing.extend(targets[ti + 1:])
-                    break
-            else:
-                succeeded += 1
-        if still_failing:
-            remaining[key] = still_failing
+        d = await _dispatch_disable_accounts(
+            provisioning_http, feed_run_id, instance_id, existing["identityId"], key, targets,
+            failure_budget=threshold - failed,
+        )
+        attempted += len(d["succeeded"]) + d["attemptedFailures"]
+        succeeded += len(d["succeeded"])
+        failed += d["attemptedFailures"]
+        if d["haltReason"]:
+            halted, halt_reason = True, f"{d['haltReason']} (during pending-dispatch retry)"
+        if d["failedTargets"]:
+            remaining[key] = d["failedTargets"]
 
     for key in keys[i:]:
         remaining[key] = list(pending[key])
@@ -348,6 +395,16 @@ async def _apply_added_updated(
 
         if resp.status_code == 404:
             body = {**target, "correlationKey": key, "sourceSystemId": instance_id}
+            start = _parse_iso_date(target.get("startDate"))
+            if start is not None and start > date.today():
+                # REQ-COR-SRC-007: a future-dated joiner is created as
+                # pending-start, not active. The lifecycle sweep
+                # (lifecycle.py, run daily by the lifecycle-sweep CronJob)
+                # flips it to active once inside the pre-start window;
+                # nothing provisions to target systems while pending-start.
+                # Only the CREATE path branches — an existing identity is
+                # never demoted back to pending-start by an update.
+                body["status"] = "pending-start"
             resp2, err2 = await _call(identity_http.post("/identities", json=body))
             if err2 or resp2.status_code != 201:
                 failed += 1
@@ -453,22 +510,15 @@ async def _apply_terminations(
             succeeded += 1
             continue
 
-        failed_targets: list[str] = []
-        for ti in range(len(provisioning_targets)):
-            connector_type = provisioning_targets[ti]
-            resp3, err3 = await _call(provisioning_http.post(
-                "/tasks", json=_disable_account_task(feed_run_id, instance_id, existing["identityId"], key, connector_type)
-            ))
-            if err3 or resp3.status_code != 202:
-                failed += 1
-                failed_targets.append(connector_type)
-                if failed >= threshold:
-                    halted = True
-                    halt_reason = err3 or f"POST /tasks (disable-account, {connector_type}) returned {resp3.status_code}"
-                    failed_targets.extend(provisioning_targets[ti + 1:])
-                    break
-        if failed_targets:
-            failed_target_dispatches[key] = failed_targets
+        d = await _dispatch_disable_accounts(
+            provisioning_http, feed_run_id, instance_id, existing["identityId"], key,
+            provisioning_targets, failure_budget=threshold - failed,
+        )
+        failed += d["attemptedFailures"]
+        if d["haltReason"]:
+            halted, halt_reason = True, d["haltReason"]
+        if d["failedTargets"]:
+            failed_target_dispatches[key] = d["failedTargets"]
         else:
             succeeded += 1
         if halted:
