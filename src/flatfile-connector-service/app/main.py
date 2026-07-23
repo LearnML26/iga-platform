@@ -15,7 +15,8 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from .ingest import run_ingestion
+from .ingest import IngestError, run_ingestion
+from .lifecycle import run_sweep
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("azure").setLevel(logging.WARNING)  # SDK HTTP pipeline logging is very verbose at INFO
@@ -54,3 +55,18 @@ async def ingest(body: IngestRequest):
     if result.get("status") == "failed":
         raise HTTPException(status_code=422, detail=result)
     return result
+
+
+@app.post("/lifecycle/sweep")
+async def lifecycle_sweep():
+    """Phase 2.4 (REQ-COR-SRC-007/008): activate due pending-start joiners,
+    apply due scheduled terminations (dispatching disable-account tasks per
+    the source instance's provisioningTargets), and retry any pending
+    provisioning dispatches from earlier runs. Triggered daily by the
+    lifecycle-sweep CronJob; safe to invoke ad hoc — a second run the same
+    day finds nothing left to do. Cluster-internal and unauthenticated,
+    same posture as /ingest. See app/lifecycle.py for design notes."""
+    try:
+        return await run_sweep()
+    except IngestError as e:
+        raise HTTPException(status_code=500, detail=str(e))

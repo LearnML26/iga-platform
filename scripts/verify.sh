@@ -220,6 +220,109 @@ else
   bad "flatfile connector: source system id not captured — skipped ingest check"
 fi
 
+# JML pipeline smoke test (2.5) + lifecycle slice (2.4) — the literal 3-row
+# joiner/transfer/leaver fixture from the spec, against a fresh source
+# system each run: a future-dated joiner lands as pending-start
+# (REQ-COR-SRC-007), a transfer updates attributes, a leaver terminates via
+# absence, and the lifecycle sweep endpoint runs without activating a
+# joiner still outside the pre-start window (its startDate is +10 days,
+# window is 3). provisioningTargets stays [] on purpose: a real target
+# would queue a disable-account task that dead-letters ~2.5h later (AD
+# creds unwired, 1R.7 note) and trip this script's own DLQ check on the
+# next run — dispatch is covered by scripts/smoketest.sh round 3 and
+# scripts/dispatch-retry-verify.sh instead. Throwaway pod names must stay
+# lowercase (RFC 1123) even though the correlation keys are uppercase.
+JML_TS=$(date +%s)
+JML_SRC="vrfy-jml-${JML_TS}"
+JML_J="VJ${JML_TS}"; JML_T="VT${JML_TS}"; JML_L="VL${JML_TS}"
+JML_FUTURE=$(date -d "+10 days" +%F)
+
+OUT=$(run_curl vrfy-jml-src -X POST http://source-system-service/source-systems \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"$JML_SRC\",\"connectorType\":\"flat-file\",\"provisioningTargets\":[]}")
+JML_SRC_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ -z "${JML_SRC_ID:-}" ]; then
+  bad "jml: source system create failed: $OUT"
+else
+  for M in \
+    '{"sourceAttribute":"EmployeeID","targetAttribute":"employeeId","isKey":true}' \
+    '{"sourceAttribute":"DisplayName","targetAttribute":"displayName","isKey":false}' \
+    '{"sourceAttribute":"Department","targetAttribute":"department","isKey":false}' \
+    '{"sourceAttribute":"StartDate","targetAttribute":"startDate","isKey":false}' \
+    '{"sourceAttribute":"TerminationDate","targetAttribute":"terminationDate","isKey":false}'; do
+    run_curl vrfy-jml-map -X POST "http://source-system-service/source-systems/${JML_SRC_ID}/mappings" \
+      -H 'Content-Type: application/json' -d "$M" > /dev/null
+  done
+
+  JML_POD="vrfy-jml-upload"
+  kubectl delete pod "$JML_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+  cat <<PODYAML | kubectl apply -f - > /dev/null 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $JML_POD
+  namespace: $NS
+  labels: { azure.workload.identity/use: "true" }
+spec:
+  serviceAccountName: flatfile-connector-service
+  restartPolicy: Never
+  containers:
+    - name: az
+      image: mcr.microsoft.com/azure-cli:latest
+      command: ["sleep", "180"]
+PODYAML
+  if kubectl wait --for=condition=Ready "pod/$JML_POD" -n $NS --timeout=60s > /dev/null 2>&1; then
+    kubectl exec -n $NS "$JML_POD" -- bash -c "
+      az login --service-principal -u \"\$AZURE_CLIENT_ID\" --tenant \"\$AZURE_TENANT_ID\" \
+        --federated-token \"\$(cat \"\$AZURE_FEDERATED_TOKEN_FILE\")\" -o none 2>/dev/null
+      printf 'EmployeeID,DisplayName,Department,StartDate,TerminationDate\n$JML_J,Joiner Vrfy,Engineering,$JML_FUTURE,\n$JML_T,Transfer Vrfy,Sales,2024-01-15,\n$JML_L,Leaver Vrfy,Support,2024-01-15,\n' > /tmp/a.csv
+      printf 'EmployeeID,DisplayName,Department,StartDate,TerminationDate\n$JML_J,Joiner Vrfy,Engineering,$JML_FUTURE,\n$JML_T,Transfer Vrfy,Marketing,2024-01-15,\n' > /tmp/b.csv
+      for F in a b; do
+        md5sum /tmp/\$F.csv | cut -d' ' -f1 | tr -d '\n' > /tmp/\$F.csv.md5
+        az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/\$F.csv -n verify/jml-$JML_TS-\$F.csv --overwrite -o none
+        az storage blob upload --auth-mode login --account-name stigadevlake -c raw -f /tmp/\$F.csv.md5 -n verify/jml-$JML_TS-\$F.csv.md5 --overwrite -o none
+      done
+    " > /dev/null 2>&1
+  fi
+  kubectl delete pod "$JML_POD" -n $NS --ignore-not-found > /dev/null 2>&1
+
+  OUT=$(run_curl vrfy-jml-ingest-a -X POST http://flatfile-connector-service/ingest \
+    -H 'Content-Type: application/json' \
+    -d "{\"sourceSystemInstanceId\":\"${JML_SRC_ID}\",\"blobPath\":\"verify/jml-${JML_TS}-a.csv\",\"triggeredBy\":\"verify-jml\"}")
+  echo "$OUT" | grep -q '"recordsAdded":3' && ok "jml round A: 3 joiners created" \
+    || bad "jml round A unexpected deltas: $OUT"
+
+  OUT=$(run_curl vrfy-jml-get-j "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$JML_J")
+  echo "$OUT" | grep -q '"status":"pending-start"' && ok "jml: future-dated joiner is pending-start (REQ-COR-SRC-007)" \
+    || bad "jml: future joiner not pending-start: $OUT"
+
+  OUT=$(run_curl vrfy-jml-ingest-b -X POST http://flatfile-connector-service/ingest \
+    -H 'Content-Type: application/json' \
+    -d "{\"sourceSystemInstanceId\":\"${JML_SRC_ID}\",\"blobPath\":\"verify/jml-${JML_TS}-b.csv\",\"triggeredBy\":\"verify-jml\"}")
+  echo "$OUT" | grep -q '"recordsUpdated":1' && echo "$OUT" | grep -q '"recordsTerminated":1' \
+    && ok "jml round B: 1 transfer updated, 1 leaver terminated" \
+    || bad "jml round B unexpected deltas: $OUT"
+
+  OUT=$(run_curl vrfy-jml-get-l "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$JML_L")
+  echo "$OUT" | grep -q '"status":"terminated"' && ok "jml: leaver is terminated" \
+    || bad "jml: leaver not terminated: $OUT"
+
+  # Lifecycle sweep (2.4): endpoint healthy, and the +10-day joiner must
+  # SURVIVE it still pending-start (outside the 3-day pre-start window).
+  # Note the sweep acts globally on the dev cluster — that's its job; any
+  # genuinely-due identities from earlier demo data will be processed here.
+  OUT=$(run_curl vrfy-jml-sweep -X POST http://flatfile-connector-service/lifecycle/sweep)
+  echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"halted":false' \
+    && ok "lifecycle sweep ran clean" || bad "lifecycle sweep failed: $OUT"
+
+  OUT=$(run_curl vrfy-jml-get-j2 "${AUTH_HDR[@]}" "http://identity-service/identities/by-correlation-key/$JML_J")
+  echo "$OUT" | grep -q '"status":"pending-start"' \
+    && ok "jml: +10d joiner still pending-start after sweep (outside 3-day window)" \
+    || bad "jml: +10d joiner unexpectedly changed by sweep: $OUT"
+
+  run_curl vrfy-jml-del -X DELETE "http://source-system-service/source-systems/${JML_SRC_ID}" > /dev/null
+fi
+
 # notification-service (3.3): health + a real end-to-end queue smoke test.
 # It has no domain HTTP API of its own (pure Service Bus consumer + email/
 # webhook fan-out worker — see src/notification-service/app/main.py), so

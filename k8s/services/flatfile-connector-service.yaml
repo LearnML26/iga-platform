@@ -33,6 +33,9 @@ spec:
             - { name: IDENTITY_SERVICE_URL, value: "http://identity-service" }
             - { name: PROVISIONING_SERVICE_URL, value: "http://provisioning-service" }
             - { name: API_AUDIENCE, value: "${API_AUDIENCE}" }
+            # REQ-COR-SRC-007 pre-start window (days before startDate at which
+            # the lifecycle sweep activates a pending-start identity)
+            - { name: PRE_START_ACTIVATION_DAYS, value: "3" }
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 10

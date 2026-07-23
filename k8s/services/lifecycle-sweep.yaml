@@ -1,0 +1,44 @@
+# Lifecycle sweep scheduler — Phase 2.4 (REQ-COR-SRC-007/008).
+#
+# A plain CronJob curling flatfile-connector-service's /lifecycle/sweep
+# endpoint daily. A native CronJob (not KEDA — KEDA isn't installed in this
+# cluster) keeps the scheduler stateless and consistent with how
+# source-system-service-migrate already runs as a one-shot Job; all the
+# actual lifecycle logic lives in the service (see
+# src/flatfile-connector-service/app/lifecycle.py for why it lives there).
+# Pod-to-pod traffic on 8080 is already covered by the namespace's
+# allow-intra-namespace-app NetworkPolicy.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lifecycle-sweep
+  namespace: iga
+spec:
+  schedule: "0 6 * * *"   # daily 06:00 UTC, before typical business hours in any US/EU timezone
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: sweep
+              image: curlimages/curl:latest
+              # --fail-with-body: a non-2xx sweep marks the Job failed (visible
+              # in kubectl get jobs / failedJobsHistory) instead of succeeding
+              # silently with an error payload.
+              args:
+                - "-sS"
+                - "--fail-with-body"
+                - "--max-time"
+                - "600"
+                - "-X"
+                - "POST"
+                - "http://flatfile-connector-service/lifecycle/sweep"
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 100m, memory: 64Mi }

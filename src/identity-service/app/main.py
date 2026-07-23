@@ -265,6 +265,14 @@ async def search_identities(
     status: Optional[IdentityStatus] = None,
     manager: Optional[str] = Query(None, alias="managerIdentityId"),
     q: Optional[str] = Query(None, description="displayName contains"),
+    terminationDateBefore: Optional[str] = Query(
+        None,
+        description="ISO date (YYYY-MM-DD); matches identities whose "
+        "terminationDate is set and <= this value. Dates are compared as "
+        "strings, so a timestamped terminationDate sorts after the bare "
+        "date for the same day — mappings should emit bare dates. Used by "
+        "the lifecycle sweep (REQ-COR-SRC-008) to find due terminations.",
+    ),
     limit: int = Query(50, le=200),
 ):
     """Faceted search (REQ-COR-ID-009)."""
@@ -275,6 +283,12 @@ async def search_identities(
     if status:
         clauses.append("c.status = @s")
         params.append({"name": "@s", "value": status.value})
+    if terminationDateBefore:
+        clauses.append(
+            "IS_DEFINED(c.terminationDate) AND NOT IS_NULL(c.terminationDate) "
+            "AND c.terminationDate != '' AND c.terminationDate <= @tdb"
+        )
+        params.append({"name": "@tdb", "value": terminationDateBefore})
     if manager:
         clauses.append("c.managerIdentityId = @m")
         params.append({"name": "@m", "value": manager})
