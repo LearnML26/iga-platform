@@ -553,8 +553,7 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   RoleEntitlement, RoleMembershipRule, RoleAssignment, PlatformRole models in
   sqldb-rbac; versioning on change; membership-rule evaluation endpoint;
   assignment events → provisioning tasks.
-  DONE (scaffold, unverified in a live cluster — branch only, pending
-  review/deploy + two new [HUMAN] gates). No spec document was available
+  DONE, live-verified in the dev cluster. No spec document was available
   to this build (IGA_Platform_Requirements_Specification.docx isn't in
   the repo) — the data model below is a reasonable, documented
   interpretation of the REQ-COR-RBAC-001..004/007..009 summary text, not
@@ -620,10 +619,44 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   401-without-token, role create + version-bump-on-entitlement-add,
   membership-rule evaluate matching the identity-service check's own
   $KEY/QA-department identity, reconcile + dispatch, assignment
-  list + revoke). ruff clean, all files compile. Not run: no live
-  cluster access from this session, and the two new [HUMAN] gates above
-  block even a clean deploy from being functionally complete until
-  granted — deploy + gates + verify.sh is the next human step.
+  list + revoke). ruff clean, all files compile.
+  Live-verified. Deploy hit three real bugs on the way, all fixed:
+  (1) rbac-service-migrate's Job never got 1R.7's stale-Job
+  delete-before-reapply treatment — deploy.sh only special-cased
+  source-system-service, so 4 failed migrate pods sat unnoticed. Fixed by
+  generalizing that block to loop over `SQL_MIGRATE_SERVICES=(source-system-service
+  rbac-service)` instead of duplicating it per service. (2) The initial
+  migrate failure really was the anticipated SQL-grant-not-yet-run
+  bootstrapping order issue (18456 login failure), confirmed via pod
+  logs — both [HUMAN] gates (SQL grant, rbac.read/rbac.write app roles +
+  assignments) were run and, on inspection of the "already exists"
+  errors returned, had actually already been satisfied by the time this
+  was checked. (3) verify.sh's own `mint_token()` broke specifically for
+  rbac-service: `az login --service-principal` treats "zero ARM-visible
+  subscriptions" as a login failure, and rbac-service is the first
+  service with no Azure ARM role assignment at all (SQL access is a
+  T-SQL grant, not ARM RBAC; Graph app roles aren't ARM RBAC either) —
+  every other service happens to dodge this because it holds some
+  Cosmos/Storage/Service Bus/Event Hub role for a real reason. Fixed
+  with `--allow-no-subscriptions`, az's own escape hatch for this case;
+  production code was never affected since it calls
+  `DefaultAzureCredential` directly rather than shelling out to `az login`.
+  Two of verify.sh's own rbac assertions were also wrong and are now
+  fixed: the evaluate check grepped the created identity's
+  correlationKey against a response that only ever returns identityIds
+  (UUIDs) — could never have passed; now captures the real id at
+  creation and checks for that. The reconcile check required
+  `assignmentsAdded==1`, but identity-service has no
+  delete-by-correlation-key endpoint, so every prior verify.sh run's
+  QA-department identity persists and legitimately keeps matching the
+  rule — loosened to `>=1`, consistent with how every other check in
+  this script already treats correlationKey accumulation as permanent.
+  Known, accepted side effect: rbac-service's reconcile test dispatches
+  real `connectorType: "ad"` tasks (same as 2.3/2.4's dispatch tests),
+  which dead-letter hours later since the AD connector's Key Vault bind
+  credentials are still an outstanding [HUMAN] gate from earlier phases
+  — drain via scripts/drain-provisioning-dlq.sh before each verify.sh run
+  until that's wired up.
 - [ ] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via
