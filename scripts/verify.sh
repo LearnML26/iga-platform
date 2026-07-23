@@ -73,7 +73,7 @@ PODYAML
   local TOKEN
   TOKEN=$(kubectl exec -n $NS "$POD" -- env AUD="$API_AUDIENCE" bash -c '
     az login --service-principal -u "$AZURE_CLIENT_ID" --tenant "$AZURE_TENANT_ID" \
-      --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" -o none 2>/dev/null &&
+      --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" --allow-no-subscriptions -o none 2>/dev/null &&
     az account get-access-token --resource "$AUD" --query accessToken -o tsv 2>/dev/null
   ')
   kubectl delete pod "$POD" -n $NS --ignore-not-found > /dev/null 2>&1
