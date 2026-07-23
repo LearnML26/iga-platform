@@ -102,6 +102,7 @@ echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "identity create without token 401
 OUT=$(run_curl vrfy-create -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
   -H 'Content-Type: application/json' \
   -d "{\"correlationKey\":\"$KEY\",\"displayName\":\"Verify Bot\",\"department\":\"QA\",\"jobTitle\":\"Probe\"}")
+VRFY_IDENTITY_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 echo "$OUT" | grep -q 'HTTP_STATUS:201' && ok "identity create 201 ($KEY)" || bad "identity create failed: $OUT"
 
 OUT=$(run_curl vrfy-dedupe -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
@@ -372,12 +373,16 @@ else
     if [ -n "${RULE_ID:-}" ]; then
       OUT=$(run_curl vrfy-rbac-eval -X POST \
         "http://rbac-service/roles/${ROLE_ID}/membership-rules/${RULE_ID}/evaluate" "${RBAC_HDR[@]}")
-      echo "$OUT" | grep -q "\"$KEY\"" && ok "membership-rule evaluate matches \$KEY ($KEY) (REQ-COR-RBAC-008)" \
-        || bad "evaluate did not match $KEY: $OUT"
+      echo "$OUT" | grep -q "\"$VRFY_IDENTITY_ID\"" && ok "membership-rule evaluate matches \$KEY ($KEY) (REQ-COR-RBAC-008)" \
+        || bad "evaluate did not match $KEY ($VRFY_IDENTITY_ID): $OUT"
     fi
 
     OUT=$(run_curl vrfy-rbac-reconcile -X POST "http://rbac-service/roles/${ROLE_ID}/reconcile" "${RBAC_HDR[@]}")
-    echo "$OUT" | grep -q '"assignmentsAdded":1' && ok "reconcile added 1 rule-sourced assignment" \
+    ADDED=$(echo "$OUT" | grep -o '"assignmentsAdded":[0-9]*' | grep -o '[0-9]*$')
+    # >=1 rather than ==1: identity-service has no delete-by-correlation-key
+    # endpoint, so every prior verify.sh run's QA-department identity persists
+    # and legitimately keeps matching this rule.
+    [ -n "$ADDED" ] && [ "$ADDED" -ge 1 ] && ok "reconcile added $ADDED rule-sourced assignment(s)" \
       || bad "reconcile unexpected result: $OUT"
     echo "$OUT" | grep -q '"dispatchSucceeded"' && ok "reconcile dispatched a provisioning task (REQ-COR-RBAC-009)" \
       || bad "reconcile did not report dispatch counts: $OUT"
