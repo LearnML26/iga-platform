@@ -457,13 +457,83 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   this fix (retry what already failed) — deciding whether a config change
   should abandon a pending retry is a separate policy question, not
   addressed here; noting it rather than expanding this fix's scope.
-- [ ] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
+- [x] **2.4 Lifecycle handling** — REQ-COR-SRC-007/008. pending-start for
   future-dated joiners; scheduled termination triggering deprovisioning
   tasks on effective date (needs a scheduler loop — KEDA cron or in-service).
+  DONE (scaffold, unverified in a live cluster — branch only, pending
+  review/deploy).
+  007: ingest's create path now branches on a mapped `startDate` — a
+  future date creates the identity as `pending-start` instead of active
+  (create path only; updates never demote an existing identity). A new
+  lifecycle sweep (flatfile-connector-service `app/lifecycle.py`, exposed
+  as `POST /lifecycle/sweep`) activates pending-start identities once
+  startDate is within `PRE_START_ACTIVATION_DAYS` (env, default 3 per the
+  spec's example); unparseable/missing startDate is left as-is with a
+  note, never activated.
+  008: a row carrying a future `terminationDate` needs no ingest change at
+  all — it's just a mapped attribute update (identity stays active). The
+  sweep's second pass finds due terminations via a new identity-service
+  filter (`terminationDateBefore` on GET /identities — string-compared ISO
+  dates, so mappings should emit bare YYYY-MM-DD), PATCHes
+  status=terminated, and dispatches disable-account tasks per the source
+  instance's provisioningTargets. Immediate absence-based terminations are
+  untouched from 2.3.
+  Scheduler decision: plain k8s CronJob (`k8s/services/lifecycle-sweep.yaml`,
+  daily 06:00 UTC, curl → the sweep endpoint) rather than the KEDA option —
+  KEDA is not installed in this cluster, and a CronJob-triggered endpoint
+  is stateless and consistent with the migrate-Job pattern. The sweep
+  lives in flatfile-connector-service because everything it needs (1R.3
+  token flow, authed identity/provisioning clients, the dispatch helper +
+  pending-dispatch persistence from the 2.3 retry fix) already exists
+  there — anywhere else duplicates all of it.
+  Also in this change: the disable-account dispatch loop was factored out
+  of `_apply_terminations`/`_retry_pending_dispatches` into a single shared
+  `_dispatch_disable_accounts` (same task shape and failure accounting for
+  ingest, retry, and sweep), and the sweep's pass 0 retries any
+  `pendingProvisioningDispatch` entries daily — closing the 2.3-fix gap
+  where a failed dispatch was only retried if that instance happened to
+  ingest another file.
+  Known limitations (deliberate, dev-scale): no pagination (≤200
+  identities/instances per sweep query); sweep-terminated identities whose
+  source system is deleted/missing get no dispatch (no other registry to
+  resolve targets from — logged); sweep endpoint is cluster-internal and
+  unauthenticated, same posture as /ingest; retry pass remains blind to
+  current provisioningTargets (documented 2.3 behavior, unchanged).
+  verify.sh gained the pending-start + sweep assertions as part of the 2.5
+  fixture below. Not run: no live cluster access from this session —
+  deploy + verify.sh is the next human step.
 - [ ] **2.5 End-to-end JML demo** — Synthetic 50-row HR CSV: joiners create
   identities, a transfer row changes attributes, a leaver row terminates and
   generates a disable-account provisioning task. verify.sh gains a pipeline
   smoke test using a 3-row fixture.
+  IN PROGRESS — everything buildable without a live cluster is done; the
+  demo run itself remains, gated on 2.4 deploying first.
+  Done: (a) verify.sh 3-row joiner/transfer/leaver pipeline smoke test
+  (fresh source system per run, unique keys; asserts 3 added with the
+  future-dated joiner pending-start, 1 updated, 1 absence-terminated, and
+  the lifecycle sweep running clean WITHOUT activating a +10-day joiner).
+  Deliberate deviation from the task text: the verify.sh fixture keeps
+  provisioningTargets=[] so the leaver terminates without dispatching — a
+  real target's task would retry ~2.5h then dead-letter (AD creds unwired)
+  and trip verify.sh's own DLQ-empty check on every subsequent run;
+  dispatch is already covered by smoketest.sh round 3 and
+  dispatch-retry-verify.sh. (b) fixtures/jml-demo cleaned up: the
+  byte-identical round1_baseline_1.csv duplicate removed; the README and
+  generator scripts referenced by the original fixture write-up were never
+  actually committed (only the CSVs landed), so generate_fixtures.py +
+  README.md were written fresh, and both CSVs regenerated 50-row with
+  J-prefixed keys — the committed E1001–E1045 keys collided with E-space
+  identities already in the dev cluster from smoke-test runs
+  (correlationKey is global, no delete endpoint), which would have
+  corrupted the demo's add/update counts.
+  Remaining (human-in-the-loop, after 2.4 deploys): regenerate fixtures
+  for live dates (python3 fixtures/jml-demo/generate_fixtures.py — the
+  whole fixture is date-relative and committed copies go stale
+  immediately), then run the README's demo sequence: baseline ingest
+  (50 added, J1046–J1050 pending-start), sweep (3 near-window joiners
+  activate, +7/+14 stay pending), round 2 (5 updated / 2 terminated),
+  and on the scheduled dates confirm the sweep terminates + dispatches
+  disable-account per provisioningTargets.
 
 ## Phase 3 — RBAC, requests, and the portals (spec §5.4, §5.7, §4)
 
