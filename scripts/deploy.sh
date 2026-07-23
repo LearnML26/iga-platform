@@ -125,27 +125,35 @@ export RBAC_SVC_CLIENT_ID="${SVC_CLIENT_IDS[rbac-service]}"
 export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
 export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
 export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --query '[0].appId' -o tsv)"
-# Job pod templates are immutable in Kubernetes, so a plain `kubectl apply`
-# fails once IMAGE_TAG changes (spec.template: field is immutable). Delete
-# any prior run before re-applying so the Job can be recreated cleanly.
-kubectl delete job/source-system-service-migrate -n iga --ignore-not-found
+# Every SQL-backed service ships an Alembic migrate Job alongside its
+# Deployment. Job pod templates are immutable in Kubernetes, so a plain
+# `kubectl apply` fails once IMAGE_TAG changes (spec.template: field is
+# immutable) — delete any prior run before re-applying so each Job can be
+# recreated cleanly. (1R.7: this bit source-system-service once already;
+# rbac-service needs the identical treatment, hence the loop rather than
+# duplicating the block per service.)
+SQL_MIGRATE_SERVICES=(source-system-service rbac-service)
+for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
+  kubectl delete "job/${SVC}-migrate" -n iga --ignore-not-found
+done
 for F in k8s/services/*.yaml; do
   envsubst < "$F" | kubectl apply -f -
 done
 
-# source-system-service ships an Alembic migrate Job alongside its Deployment
-# (see k8s/services/source-system-service.yaml). Wait for it, then roll the
-# Deployment so pods restart cleanly against the finished schema rather than
-# racing it on first request.
-if kubectl get job/source-system-service-migrate -n iga > /dev/null 2>&1; then
-  echo "==> waiting for source-system-service-migrate Job"
-  if kubectl wait --for=condition=complete job/source-system-service-migrate -n iga --timeout=180s; then
-    kubectl rollout restart deployment/source-system-service -n iga
-  else
-    echo "!! migrate Job did not complete — check: kubectl logs -n iga job/source-system-service-migrate"
-    echo "!! this is very likely the SQL permission grant below not having been run yet"
+# Wait for each migrate Job, then roll its Deployment so pods restart
+# cleanly against the finished schema rather than racing it on first
+# request.
+for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
+  if kubectl get "job/${SVC}-migrate" -n iga > /dev/null 2>&1; then
+    echo "==> waiting for ${SVC}-migrate Job"
+    if kubectl wait --for=condition=complete "job/${SVC}-migrate" -n iga --timeout=180s; then
+      kubectl rollout restart "deployment/${SVC}" -n iga
+    else
+      echo "!! ${SVC}-migrate Job did not complete — check: kubectl logs -n iga job/${SVC}-migrate"
+      echo "!! this is very likely the SQL permission grant below not having been run yet"
+    fi
   fi
-fi
+done
 
 echo ""
 echo "=== Deployment complete ==="
