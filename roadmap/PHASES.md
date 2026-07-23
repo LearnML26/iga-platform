@@ -653,10 +653,14 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   this script already treats correlationKey accumulation as permanent.
   Known, accepted side effect: rbac-service's reconcile test dispatches
   real `connectorType: "ad"` tasks (same as 2.3/2.4's dispatch tests),
-  which dead-letter hours later since the AD connector's Key Vault bind
-  credentials are still an outstanding [HUMAN] gate from earlier phases
-  — drain via scripts/drain-provisioning-dlq.sh before each verify.sh run
-  until that's wired up.
+  which dead-letter hours later. Confirmed directly with the user: this
+  dev environment has no real AD/LDAPS server to bind to at all, so the
+  "ad-connector" Key Vault/[HUMAN] gate mentioned in deploy.sh's printed
+  next-steps isn't a pending task — there's nothing real to point it at
+  yet, and the dead-lettering is permanent, not transient. verify.sh now
+  calls scripts/drain-provisioning-dlq.sh on itself right after the rbac
+  block (self-cleans prior runs' accumulated dead letters) rather than
+  requiring that as a manual pre-step every time.
 - [ ] **3.2 access-request-service** — REQ-COR-REQ-001..003, 006, 007, 009.
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via

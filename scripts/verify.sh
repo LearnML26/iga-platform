@@ -403,6 +403,15 @@ else
   fi
 fi
 
+# The reconcile/revoke dispatches just above queue real connectorType:"ad"
+# tasks that cannot succeed — there's no real AD/LDAPS server for this dev
+# cluster to bind to (confirmed, not just "not yet wired"), so they will
+# dead-letter on their own schedule regardless of when this script runs.
+# Self-drain here rather than requiring a manual pre-step before every
+# verify.sh run; this only removes already-dead-lettered messages, never
+# the live queue.
+"$(dirname "$0")/drain-provisioning-dlq.sh" > /dev/null 2>&1
+
 # notification-service (3.3): health + a real end-to-end queue smoke test.
 # It has no domain HTTP API of its own (pure Service Bus consumer + email/
 # webhook fan-out worker — see src/notification-service/app/main.py), so
