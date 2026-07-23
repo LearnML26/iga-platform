@@ -421,10 +421,18 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   status=terminated PATCH itself) is unchanged — only the dispatch loop's
   failure handling changed. Still explicitly no saga/rollback mechanism,
   per 2.3's original scope note. ruff clean and the file compiles; no new
-  test framework introduced (none exists in this repo yet) — live
-  verification (temporarily break one of two provisioningTargets, confirm
-  the failure is retried and eventually dispatched on a later run) not
-  yet run, see fix/provisioning-dispatch-retry branch/PR.
+  test framework introduced (none exists in this repo yet).
+  Live-verified against the deployed cluster (scripts/dispatch-retry-verify.sh,
+  see fix/provisioning-dispatch-retry branch/PR): terminated an identity with
+  provisioningTargets=["ad","entra"] while provisioning-service was scaled to
+  0 replicas — the status=terminated PATCH succeeded regardless (2 apply
+  failures recorded, one per target), and both landed in
+  pendingProvisioningDispatch instead of being lost. After removing "entra"
+  from provisioningTargets and restoring provisioning-service, the next run's
+  retry pass re-dispatched BOTH targets (2 attempted, 2 succeeded) and
+  cleared the pending entry — empirically confirming finding (2) below (retry
+  is blind to config changes) as actual runtime behavior, not just a read of
+  the code.
   Two things found while planning that live verification, before running
   it: (1) a bogus/unrecognized connectorType is NOT a usable way to force
   a dispatch failure — `submit_task` never validates connectorType against
