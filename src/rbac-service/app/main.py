@@ -518,6 +518,42 @@ async def list_assignments(
     return result.scalars().all()
 
 
+@app.get("/assignments", dependencies=[require_role("rbac.read")])
+async def list_assignments_by_identity(
+    identityId: str,
+    status: Optional[str] = "active",
+    limit: int = Query(50, le=200),
+    session: AsyncSession = Depends(get_session),
+):
+    """Cross-role assignment view for one identity (Phase 3.6 — the portal's
+    "my access", REQ-UI-030). Joined with the role so the UI gets names and
+    entitlement summaries without N+1 calls."""
+    stmt = (
+        select(RoleAssignment, Role)
+        .join(Role, RoleAssignment.roleId == Role.id)
+        .where(RoleAssignment.identityId == identityId)
+    )
+    if status:
+        stmt = stmt.where(RoleAssignment.status == status)
+    stmt = stmt.order_by(RoleAssignment.createdDate.desc()).limit(limit)
+    result = await session.execute(stmt)
+    out = []
+    for a, role in result.all():
+        await session.refresh(role, attribute_names=["entitlements"])
+        out.append({
+            "id": a.id, "roleId": a.roleId, "identityId": a.identityId,
+            "assignmentType": a.assignmentType, "status": a.status,
+            "createdDate": a.createdDate, "revokedDate": a.revokedDate,
+            "roleName": role.name, "roleDescription": role.description,
+            "entitlements": [
+                {"targetSystemInstanceId": e.targetSystemInstanceId,
+                 "connectorType": e.connectorType, "entitlementRef": e.entitlementRef}
+                for e in role.entitlements
+            ],
+        })
+    return out
+
+
 @app.delete(
     "/roles/{role_id}/assignments/{assignment_id}", response_model=RoleAssignmentOut,
     dependencies=[require_role("rbac.write")],

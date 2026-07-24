@@ -141,7 +141,7 @@ export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --qu
 # recreated cleanly. (1R.7: this bit source-system-service once already;
 # rbac-service needs the identical treatment, hence the loop rather than
 # duplicating the block per service.)
-SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service)
+SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service provisioning-service)
 for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
   kubectl delete "job/${SVC}-migrate" -n iga --ignore-not-found
 done
@@ -240,6 +240,13 @@ echo "      CREATE USER [mi-${SUFFIX}-access-request-service] FROM EXTERNAL PROV
 echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-access-request-service];"
 echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-access-request-service];"
 echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-access-request-service];  -- needed for Alembic's CREATE TABLE"
+echo "  - [ONE-TIME, HUMAN] Grant provisioning-service's managed identity access to sqldb-provisioning (Phase 3.5"
+echo "    task-state store — same pattern as the other SQL services above, run from inside the VNet as an"
+echo "    iga-platform-admins member):"
+echo "      CREATE USER [mi-${SUFFIX}-provisioning-service] FROM EXTERNAL PROVIDER;"
+echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
+echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
+echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-provisioning-service];  -- needed for Alembic's CREATE TABLE"
 echo "  - [HUMAN gate, Phase 3.2] access-request-service needs two NEW iga-platform-api app roles that don't exist"
 echo "    yet (requests.read, requests.write) — same Graph app-update pattern as 3.1's rbac.read/rbac.write. Run:"
 echo "      API_APP_ID=\$(az ad app list --display-name iga-platform-api --query '[0].id' -o tsv)"
