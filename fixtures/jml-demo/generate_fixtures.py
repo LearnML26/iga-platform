@@ -28,12 +28,17 @@ Round 2 (round2_transfers_terminations.csv):
     disable-account tasks (the 008 assertion).
   - The 5 future joiners are unchanged from round 1.
 
-Correlation keys are J-prefixed (J1001...) on purpose: correlationKey is
-global per tenant, identity-service has no delete endpoint, and the dev
-cluster already holds E1xxx/E2xxx identities left by smoke-test runs — an
-E-prefixed fixture would silently collide with them and corrupt the demo's
-add/update counts (this bit an earlier fixture revision, which shipped as
-E1001-E1045).
+Correlation keys use KEY_PREFIX+FIRST_ID (currently K1002...) rather than
+E-prefixed: correlationKey is global per tenant, identity-service has no
+delete endpoint, and the dev cluster already holds E1xxx/E2xxx identities
+left by smoke-test runs — an E-prefixed fixture would silently collide
+with them and corrupt the demo's add/update counts (this bit an earlier
+fixture revision, which shipped as E1001-E1045). To rerun the demo after
+a successful run, bump KEY_PREFIX and/or FIRST_ID to a value that has
+never been used before — jml-demo.sh no longer hardcodes any key
+literal; it sources fixture_keys.env (written by this script, alongside
+the CSVs) for every key it checks, so a rerun with new constants just
+works.
 """
 import csv
 import random
@@ -109,12 +114,37 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def write_keys_env(path: Path, round1: list[dict], today: date) -> None:
+    """Sidecar shell-sourceable file naming this run's actual generated
+    keys. jml-demo.sh sources this instead of hardcoding J1xxx literals —
+    KEY_PREFIX/FIRST_ID are meant to be bumped to rerun the demo (global
+    correlationKey, no delete endpoint), and hardcoded key literals in the
+    consuming script silently break the moment either constant changes.
+    This file is the single source of truth for "what did we actually
+    generate this run," regenerated every run alongside the CSVs."""
+    joiners = round1[ESTABLISHED:]
+    inside = [r["EmployeeID"] for i, r in enumerate(joiners) if FUTURE_JOINER_OFFSETS[i] <= 3]
+    outside = [r["EmployeeID"] for i, r in enumerate(joiners) if FUTURE_JOINER_OFFSETS[i] > 3]
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(f'FIRST_ESTABLISHED_KEY="{round1[0]["EmployeeID"]}"\n')
+        fh.write(f'JOINER_KEYS="{" ".join(r["EmployeeID"] for r in joiners)}"\n')
+        fh.write(f'JOINER_INSIDE_WINDOW="{" ".join(inside)}"\n')
+        fh.write(f'JOINER_OUTSIDE_WINDOW="{" ".join(outside)}"\n')
+        fh.write(f'DROPPED_KEYS="{" ".join(round1[i]["EmployeeID"] for i in DROPPED_INDEXES)}"\n')
+        fh.write(f'TRANSFER_KEYS="{" ".join(round1[i]["EmployeeID"] for i in TRANSFER_INDEXES)}"\n')
+        for idx, (i, off) in enumerate(SCHEDULED_TERM.items(), start=1):
+            key = round1[i]["EmployeeID"]
+            fh.write(f'SCHED_TERM_KEY_{idx}="{key}"\n')
+            fh.write(f'SCHED_TERM_DATE_{idx}="{(today + timedelta(days=off)).isoformat()}"\n')
+
+
 def main() -> None:
     today = date.today()
     outdir = Path(__file__).parent
     round1, round2 = build_rows(today)
     write_csv(outdir / "round1_baseline.csv", round1)
     write_csv(outdir / "round2_transfers_terminations.csv", round2)
+    write_keys_env(outdir / "fixture_keys.env", round1, today)
     dropped = [round1[i]["EmployeeID"] for i in DROPPED_INDEXES]
     transfers = [round1[i]["EmployeeID"] for i in TRANSFER_INDEXES]
     sched = {round1[i]["EmployeeID"]: (today + timedelta(days=off)).isoformat()
