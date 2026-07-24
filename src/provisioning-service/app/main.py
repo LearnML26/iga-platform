@@ -137,24 +137,37 @@ async def _send_task_message(task: ProvisioningTask, scheduled: datetime | None 
 
 
 @app.post("/tasks", status_code=202, dependencies=[require_role("provisioning.write")])
-async def submit_task(task: ProvisioningTask, session: AsyncSession = Depends(get_session)):
+async def submit_task(task: ProvisioningTask):
     task.taskId = task.taskId or str(uuid.uuid4())
     # Record first, then message — the worker can receive the message
     # milliseconds later and must find the row (it backfills a missing row
     # for pre-migration messages, but new tasks should never need that).
-    session.add(ProvisioningTaskRecord(
-        taskId=task.taskId,
-        sourceType=task.sourceType,
-        sourceRef=task.sourceRef,
-        identityId=task.identityId,
-        instanceId=task.instanceId,
-        connectorType=task.connectorType,
-        operationType=task.operationType.value,
-        entitlementRef=task.entitlementRef,
-        payload=task.payload,
-        status="queued",
-    ))
-    await session.commit()
+    # Best-effort, same posture as _set_status/_is_cancelled below: task
+    # submission is the one load-bearing path every other service depends
+    # on for real provisioning, and it must survive the store being
+    # unreachable (e.g. the SQL grant not run yet, or any transient DB
+    # issue) exactly as it did before this table existed. A prior version
+    # of this endpoint took `session` as a FastAPI dependency and committed
+    # unguarded — that 500'd the whole endpoint, including the Service Bus
+    # send below, on any DB hiccup. Real regression, fixed here rather than
+    # left as "just run the SQL grant".
+    try:
+        async with SessionLocal() as session:
+            session.add(ProvisioningTaskRecord(
+                taskId=task.taskId,
+                sourceType=task.sourceType,
+                sourceRef=task.sourceRef,
+                identityId=task.identityId,
+                instanceId=task.instanceId,
+                connectorType=task.connectorType,
+                operationType=task.operationType.value,
+                entitlementRef=task.entitlementRef,
+                payload=task.payload,
+                status="queued",
+            ))
+            await session.commit()
+    except Exception:
+        log.exception("task-record write failed for %s; queue submission continues", task.taskId)
     await _send_task_message(task)
     log.info("task %s queued (session %s:%s, op %s)",
              task.taskId, task.identityId, task.instanceId, task.operationType)
