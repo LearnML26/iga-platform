@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rules-engine-service
+  namespace: iga
+  annotations:
+    azure.workload.identity/client-id: "${RULES_ENGINE_SVC_CLIENT_ID}"
+---
+# One-shot Alembic migration, applied before the Deployment rolls out.
+# Re-run safe: alembic upgrade head is a no-op once the DB is at head.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rules-engine-service-migrate
+  namespace: iga
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: rules-engine-service-migrate
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: rules-engine-service
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ${ACR_LOGIN_SERVER}/rules-engine-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - { name: SQL_SERVER,   value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE, value: "sqldb-rules" }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rules-engine-service
+  namespace: iga
+spec:
+  # replicas 1, not the usual 2: the cluster's vCPU quota is tight
+  # (CLAUDE.md), a second replica would run a duplicate sweep loop
+  # (idempotent but wasteful), and the EH client load-balances partitions
+  # across instances if this is ever scaled up.
+  replicas: 1
+  selector:
+    matchLabels: { app: rules-engine-service }
+  template:
+    metadata:
+      labels:
+        app: rules-engine-service
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: rules-engine-service
+      containers:
+        - name: rules-engine-service
+          image: ${ACR_LOGIN_SERVER}/rules-engine-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: SQL_SERVER,   value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE, value: "sqldb-rules" }
+            - { name: EVENTHUB_NAMESPACE, value: "${EVENTHUB_NAMESPACE}.servicebus.windows.net" }
+            - { name: LAKE_STORAGE_ACCOUNT, value: "${LAKE_STORAGE_ACCOUNT}" }
+            - { name: RBAC_SERVICE_URL, value: "http://rbac-service" }
+            - { name: ENTRA_TENANT_ID, value: "${ENTRA_TENANT_ID}" }
+            - { name: API_AUDIENCE, value: "${API_AUDIENCE}" }
+            - { name: RULES_SWEEP_INTERVAL_MINUTES, value: "60" }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rules-engine-service
+  namespace: iga
+spec:
+  selector: { app: rules-engine-service }
+  ports: [{ port: 80, targetPort: 8080 }]

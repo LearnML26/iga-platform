@@ -891,10 +891,52 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
 
 ## Phase 4 — Assurance: certifications, rules, API engine (spec §5.5, §5.9, §5.6)
 
-- [ ] **4.1 rules-engine-service** — REQ-COR-RULES-001..003, 006, 007.
+- [x] **4.1 rules-engine-service** — REQ-COR-RULES-001..003, 006, 007.
   Event Hubs consumer (consumer group `rules-engine`); RuleDefinition +
   RuleExecutionLog in sqldb-rules; attribute-change triggers re-running RBAC
   membership rules; scheduled sweep loop; every evaluation logged.
+  DONE (code complete; live verification pending deploy + two new gates).
+  Same no-spec-document discipline: the one-line summary above is the only
+  source; interpretations flagged in the service's module docstring.
+  Verified before building: the `rules-engine` consumer group and the
+  `identity-changes` hub have existed in messaging.bicep since Phase 1
+  (unused until now), and identity-service's event shape is {eventId,
+  eventType, occurredAt, identityId, tenantId, snapshot} with eventTypes
+  IdentityCreated/IdentityAttributeChanged (carrying _changedFields)/
+  IdentityTerminated (+ IdentityClaimed since the approver-binding task).
+  Model: RuleDefinition (triggerEventTypes; optional changedFieldsFilter
+  matched against _changedFields; runOnSweep; actionType+actionConfig) +
+  append-only RuleExecutionLog. EVERY evaluation is logged including
+  non-matches with the reason (the literal "every evaluation logged");
+  no retention policy yet — dev-scale, follow-up. The ONLY actionType is
+  'rbac-reconcile' (reconcile configured roleIds, or every active role
+  with an enabled membership rule when unset — O(roles) per firing,
+  acceptable at dev scale, and reconcile is idempotent so over-firing is
+  safe). Unknown actionTypes are 422-rejected at create/update, never
+  silently stored. POST /rules/{id}/run executes manually through the
+  same logged path — the hook 4.2's dry-run work extends.
+  Consumer: EventHubConsumerClient + BlobCheckpointStore on a new
+  `eventhub-checkpoints` container (data.bicep). Un-checkpointed
+  partitions start at "@latest" — a fresh environment does NOT replay up
+  to 7 days of history against rules that postdate it; deliberate, noted.
+  On unexpected per-event errors the partition checkpoints anyway: rules
+  are convergent and the sweep loop is the designed catch-up, wedging a
+  partition on one bad event would be worse. Sweep loop: every
+  RULES_SWEEP_INTERVAL_MINUTES (60 default), enabled+runOnSweep rules run.
+  k8s: replicas 1, not the usual 2 — quota-tight cluster, and a second
+  replica would duplicate the sweep (EH client would load-balance
+  partitions fine if ever scaled).
+  New gates, printed by deploy.sh: sqldb-rules SQL grant; rules.read/
+  rules.write app roles (born with allowedMemberTypes User+Application —
+  spa-gate already flipped all earlier roles) + grants of rules.*,
+  rbac.read, rbac.write to the service's MI. Data-plane RBAC in deploy.sh:
+  Event Hubs Data Receiver + Storage Blob Data Contributor (checkpoints).
+  verify.sh: health, 401, unknown-actionType 422, manual run, and the
+  real end-to-end event test — PATCH this run's identity's jobTitle and
+  poll the execution log for the matched event-triggered row (publish →
+  hub → consumer → evaluate → log). The verify rule's reconcile-all is
+  deliberately a no-op (no active roles with membership rules exist at
+  that point in the run) so the pipeline is proven without side effects.
 - [ ] **4.2 Rules: dry-run + guarded revocation** — REQ-COR-RULES-008/009.
   Simulation endpoint reporting affected identities; configurable delay
   window before critical-tier revocations dispatch.

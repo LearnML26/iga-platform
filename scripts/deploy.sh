@@ -51,7 +51,7 @@ kubelogin convert-kubeconfig -l azurecli
 OIDC_ISSUER=$(az aks show -g "$RG_COMPUTE" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 
 declare -A SVC_CLIENT_IDS
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service rules-engine-service; do
   MI_NAME="mi-${SUFFIX}-${SVC}"
   az identity create -g "$RG_COMPUTE" -n "$MI_NAME" -l "$LOCATION" -o none
   CLIENT_ID=$(az identity show -g "$RG_COMPUTE" -n "$MI_NAME" --query clientId -o tsv)
@@ -108,8 +108,20 @@ az role assignment create --assignee "$AR_PRINCIPAL" \
   --role "Azure Service Bus Data Sender" \
   --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.ServiceBus/namespaces/${SB_NAMESPACE}" -o none || true
 
+# rules-engine-service (Phase 4.1): Event Hubs Data Receiver (consumes
+# identity-changes on the rules-engine consumer group) + Storage Blob Data
+# Contributor on the lake account (BlobCheckpointStore ownership/checkpoint
+# blobs in the eventhub-checkpoints container).
+RULES_PRINCIPAL=$(az identity show -g "$RG_COMPUTE" -n "mi-${SUFFIX}-rules-engine-service" --query principalId -o tsv)
+az role assignment create --assignee "$RULES_PRINCIPAL" \
+  --role "Azure Event Hubs Data Receiver" \
+  --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.EventHub/namespaces/${EVH_NAMESPACE}" -o none || true
+az role assignment create --assignee "$RULES_PRINCIPAL" \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/${SUB_ID}/resourceGroups/${RG_DATA}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}" -o none || true
+
 echo "==> [4/5] Building and pushing images (ACR server-side build — no local Docker needed)"
-for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service; do
+for SVC in identity-service provisioning-service source-system-service flatfile-connector-service notification-service rbac-service access-request-service rules-engine-service; do
   # az acr build uploads the context, builds in ACR, and pushes the image
   # to ${ACR_LOGIN_SERVER}/${SVC}:${IMAGE_TAG} automatically on success.
   az acr build \
@@ -130,6 +142,7 @@ export SOURCE_SYSTEM_SVC_CLIENT_ID="${SVC_CLIENT_IDS[source-system-service]}"
 export FLATFILE_CONNECTOR_SVC_CLIENT_ID="${SVC_CLIENT_IDS[flatfile-connector-service]}"
 export NOTIFICATION_SVC_CLIENT_ID="${SVC_CLIENT_IDS[notification-service]}"
 export RBAC_SVC_CLIENT_ID="${SVC_CLIENT_IDS[rbac-service]}"
+export RULES_ENGINE_SVC_CLIENT_ID="${SVC_CLIENT_IDS[rules-engine-service]}"
 export ACCESS_REQUEST_SVC_CLIENT_ID="${SVC_CLIENT_IDS[access-request-service]}"
 export LAKE_STORAGE_ACCOUNT="$STORAGE_ACCOUNT"
 export ENTRA_TENANT_ID="$(az account show --query tenantId -o tsv)"
@@ -141,7 +154,7 @@ export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --qu
 # recreated cleanly. (1R.7: this bit source-system-service once already;
 # rbac-service needs the identical treatment, hence the loop rather than
 # duplicating the block per service.)
-SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service provisioning-service)
+SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service provisioning-service rules-engine-service)
 for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
   kubectl delete "job/${SVC}-migrate" -n iga --ignore-not-found
 done
@@ -252,6 +265,39 @@ echo "      CREATE USER [mi-${SUFFIX}-provisioning-service] FROM EXTERNAL PROVID
 echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
 echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
 echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-provisioning-service];  -- needed for Alembic's CREATE TABLE"
+echo "  - [ONE-TIME, HUMAN] Grant rules-engine-service's managed identity access to sqldb-rules (same pattern"
+echo "    as the other SQL services above — run from inside the VNet as an iga-platform-admins member):"
+echo "      CREATE USER [mi-${SUFFIX}-rules-engine-service] FROM EXTERNAL PROVIDER;"
+echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-rules-engine-service];"
+echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-rules-engine-service];"
+echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-rules-engine-service];  -- needed for Alembic's CREATE TABLE"
+echo "  - [HUMAN gate, Phase 4.1] rules-engine-service needs two NEW iga-platform-api app roles (rules.read,"
+echo "    rules.write) — same Graph app-update pattern as 3.1/3.2. Run:"
+echo "      API_APP_ID=\$(az ad app list --display-name iga-platform-api --query '[0].id' -o tsv)"
+echo "      CUR_ROLES=\$(az ad app show --id \"\$API_APP_ID\" --query appRoles -o json)"
+echo "      NEW_ROLES=\$(python3 -c \""
+echo "import json,sys,uuid"
+echo "roles = json.loads(sys.argv[1])"
+echo "for v in ('rules.read', 'rules.write'):"
+echo "    if not any(r['value'] == v for r in roles):"
+echo "        roles.append({'id': str(uuid.uuid4()), 'allowedMemberTypes': ['Application', 'User'],"
+echo "                      'displayName': v, 'value': v, 'description': v, 'isEnabled': True})"
+echo "print(json.dumps(roles))"
+echo "\" \"\$CUR_ROLES\")"
+echo "      az ad app update --id \"\$API_APP_ID\" --app-roles \"\$NEW_ROLES\""
+echo "    (allowedMemberTypes includes 'User' from the start — the 3.4 spa-gate already made every earlier"
+echo "    role user-assignable; new roles should be born that way.)"
+echo "    Then grant rules-engine-service's managed identity all four roles it needs (rules.read/rules.write"
+echo "    for its own API, rbac.read+rbac.write to list roles and run reconcile):"
+echo "      API_SP_ID=\$(az ad sp list --filter \"displayName eq 'iga-platform-api'\" --query '[0].id' -o tsv)"
+echo "      RULES_SP_ID=\$(az ad sp list --filter \"displayName eq 'mi-${SUFFIX}-rules-engine-service'\" --query '[0].id' -o tsv)"
+echo "      for ROLE in rules.read rules.write rbac.read rbac.write; do"
+echo "        ROLE_ID=\$(az ad sp show --id \"\$API_SP_ID\" --query \"appRoles[?value=='\$ROLE'].id | [0]\" -o tsv)"
+echo "        az rest --method POST --uri \"https://graph.microsoft.com/v1.0/servicePrincipals/\$RULES_SP_ID/appRoleAssignments\" \\"
+echo "          --body \"{\\\"principalId\\\":\\\"\$RULES_SP_ID\\\",\\\"resourceId\\\":\\\"\$API_SP_ID\\\",\\\"appRoleId\\\":\\\"\$ROLE_ID\\\"}\""
+echo "      done"
+echo "    (If you re-ran ./scripts/spa-gate.sh after these roles exist, also re-run its step 4 or the loop"
+echo "    above with your own user to pick up rules.read/rules.write for the admin console later.)"
 echo "  - [HUMAN gate, Phase 3.2] access-request-service needs two NEW iga-platform-api app roles that don't exist"
 echo "    yet (requests.read, requests.write) — same Graph app-update pattern as 3.1's rbac.read/rbac.write. Run:"
 echo "      API_APP_ID=\$(az ad app list --display-name iga-platform-api --query '[0].id' -o tsv)"
