@@ -3,7 +3,7 @@ ORM models for the Source System Service (REQ-COR-SRC-001).
 SourceSystemInstance -> AttributeMapping (1:N), SourceSystemInstance -> FeedRun (1:N).
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -16,7 +16,7 @@ def _uuid() -> str:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class SourceSystemInstance(Base):

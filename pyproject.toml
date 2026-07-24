@@ -1,0 +1,24 @@
+# Repo-wide Python tooling config. No [project] section on purpose — the
+# services are built/deployed per-directory (src/<service>), this file only
+# anchors lint settings at the repo root.
+
+[tool.ruff]
+line-length = 120
+# Every service image is python:3.12-slim; without this ruff infers an older
+# target and withholds 3.10+ modernization fixes (X | None etc.).
+target-version = "py312"
+
+[tool.ruff.lint]
+# B008 (function call in argument default): FastAPI's dependency-injection
+# idiom IS Depends()/Query()/Body() as argument defaults — flagged 39 times
+# across every service's main.py, all false positives for this pattern.
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# DTZ011 (date.today() without tz): the 2.4 lifecycle design deliberately
+# compares feed-provided bare ISO dates (YYYY-MM-DD) against the pod's UTC
+# calendar date — documented in roadmap/PHASES.md 2.4. Making these
+# timezone-aware objects would change behavior for zero benefit. Scoped to
+# the two files where the pattern is intentional, not ignored repo-wide.
+"src/flatfile-connector-service/app/ingest.py" = ["DTZ011"]
+"src/flatfile-connector-service/app/lifecycle.py" = ["DTZ011"]

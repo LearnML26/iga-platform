@@ -14,24 +14,23 @@ Architecture:
   register their handlers here (grant/revoke are idempotent per
   REQ-COR-PROV-007: verify-before-write inside each connector).
 """
-import os
-import json
-import uuid
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+import os
+import uuid
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Optional
 
+from azure.identity.aio import DefaultAzureCredential
+from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusMessage
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus.exceptions import OperationTimeoutError
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from azure.identity.aio import DefaultAzureCredential
-from azure.servicebus.aio import ServiceBusClient
-from azure.servicebus import ServiceBusMessage, NEXT_AVAILABLE_SESSION
-from azure.servicebus.exceptions import OperationTimeoutError
 
-from .connectors import CONNECTOR_REGISTRY, ConnectorError
 from .auth import require_role
+from .connectors import CONNECTOR_REGISTRY, ConnectorError
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("provisioning-service")
@@ -61,7 +60,7 @@ class ProvisioningTask(BaseModel):
     instanceId: str
     connectorType: str  # 'ad' | 'entra' | ...
     operationType: OperationType
-    entitlementRef: Optional[str] = None
+    entitlementRef: str | None = None
     payload: dict = {}
     attemptCount: int = 0
 
@@ -160,7 +159,7 @@ async def handle_message(receiver, msg) -> None:
         else:
             # Re-schedule with backoff
             delay = BACKOFF_MINUTES[min(task.attemptCount - 1, len(BACKOFF_MINUTES) - 1)]
-            scheduled = datetime.now(timezone.utc) + timedelta(minutes=delay)
+            scheduled = datetime.now(UTC) + timedelta(minutes=delay)
             async with app.state.sb.get_queue_sender(TASK_QUEUE) as sender:
                 retry_msg = ServiceBusMessage(
                     task.model_dump_json(),
@@ -183,5 +182,5 @@ async def notify_failure(task: ProvisioningTask, error: str) -> None:
             "instanceId": task.instanceId,
             "operationType": task.operationType.value,
             "error": error,
-            "occurredAt": datetime.now(timezone.utc).isoformat(),
+            "occurredAt": datetime.now(UTC).isoformat(),
         })))

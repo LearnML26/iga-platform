@@ -54,7 +54,7 @@ Known limitations, deliberate at dev scale:
 import logging
 import os
 from datetime import date
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from azure.identity.aio import DefaultAzureCredential
@@ -98,7 +98,7 @@ async def run_sweep() -> dict[str, Any]:
         notes: list[str] = []
         failures = 0
         halted = False
-        halt_reason: Optional[str] = None
+        halt_reason: str | None = None
         retry_attempted = retry_succeeded = 0
         ps_checked = activated = 0
         due = terminated = dispatch_ok = dispatch_failed = 0

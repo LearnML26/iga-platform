@@ -4,10 +4,9 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy.ext.asyncio import AsyncEngine
-
 from app.db import Base, engine
 from app.models import AttributeMapping, FeedRun, SourceSystemInstance  # noqa: F401  (register models)
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 config = context.config
 if config.config_file_name is not None:

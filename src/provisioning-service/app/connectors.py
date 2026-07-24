@@ -8,8 +8,8 @@ Both connectors implement verify-before-write so grant/revoke are idempotent
 environment variables that the AKS CSI Secret Store driver mounts from
 Key Vault (REQ-INF-061/062) — never hardcoded.
 """
-import os
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import httpx

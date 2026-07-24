@@ -29,9 +29,9 @@ import asyncio
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException
 from azure.identity.aio import DefaultAzureCredential
 from azure.servicebus.aio import ServiceBusClient
+from fastapi import FastAPI, HTTPException
 
 from .worker import worker_loop
 
