@@ -41,8 +41,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 SEED = 42
-KEY_PREFIX = "J"
-FIRST_ID = 1001
+KEY_PREFIX = "K"
+FIRST_ID = 1002
 ESTABLISHED = 45
 FUTURE_JOINER_OFFSETS = [1, 2, 3, 7, 14]     # days from today; 3 inside / 2 outside the default 3-day window
 DROPPED_INDEXES = [4, 11]                     # 0-based indexes into the established block -> immediate leavers
