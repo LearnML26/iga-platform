@@ -1,0 +1,135 @@
+/* IGA Platform web — single hand-rolled stylesheet, no UI framework
+   (deliberate: keeps the dependency surface at MSAL + router only). */
+:root {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --border: #d9dde3;
+  --text: #1b2733;
+  --muted: #5b6a7a;
+  --accent: #0f4c81;
+  --accent-hover: #0d3f6b;
+  --danger: #a4262c;
+  --ok: #0b6a0b;
+  --warn: #8a6d00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+h2 { margin: 0 0 16px; font-size: 20px; }
+h3 { margin: 24px 0 8px; font-size: 15px; }
+.mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 12.5px; }
+.muted { color: var(--muted); font-size: 12.5px; }
+
+/* Shell */
+.shell { min-height: 100vh; display: flex; flex-direction: column; }
+.topbar {
+  display: flex; align-items: center; gap: 20px;
+  background: var(--accent); color: #fff; padding: 0 20px; height: 52px;
+}
+.brand { font-weight: 600; font-size: 15px; }
+.topbar nav { display: flex; align-items: center; gap: 4px; flex: 1; }
+.nav-group {
+  margin-left: 16px; margin-right: 4px; opacity: 0.65;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.topbar nav a {
+  color: #fff; text-decoration: none; padding: 6px 10px; border-radius: 4px; opacity: 0.85;
+}
+.topbar nav a:hover { background: rgba(255, 255, 255, 0.12); opacity: 1; }
+.topbar nav a.active { background: rgba(255, 255, 255, 0.2); opacity: 1; }
+.user-box { display: flex; align-items: center; gap: 10px; }
+.content { flex: 1; padding: 24px; max-width: 1200px; width: 100%; margin: 0 auto; }
+
+/* Login */
+.login-shell {
+  min-height: 100vh; display: grid; place-items: center;
+  background: linear-gradient(160deg, #0f4c81 0%, #123a5c 100%);
+}
+.login-card {
+  background: var(--surface); border-radius: 8px; padding: 40px 48px;
+  max-width: 420px; text-align: center; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.login-card h1 { margin: 0 0 4px; font-size: 24px; color: var(--accent); }
+.login-card > p { margin: 0 0 24px; color: var(--muted); }
+.login-note { margin-top: 20px; font-size: 12px; color: var(--muted); text-align: left; }
+
+/* Buttons */
+.btn {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-danger { color: var(--danger); border-color: var(--danger); }
+.btn-ghost { border-color: transparent; background: transparent; color: inherit; opacity: 0.8; }
+.btn-ghost:hover { opacity: 1; border-color: var(--border); }
+
+/* Filters + tables */
+.filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-bar input, .filter-bar select {
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px;
+  min-width: 160px; background: var(--surface);
+}
+.data-table {
+  width: 100%; border-collapse: collapse; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+}
+.data-table th {
+  text-align: left; padding: 9px 12px; background: #eef1f5; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted);
+}
+.data-table td { padding: 9px 12px; border-top: 1px solid var(--border); vertical-align: top; }
+.data-table a { color: var(--accent); text-decoration: none; }
+.data-table a:hover { text-decoration: underline; }
+.error-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: flex; gap: 6px; }
+
+/* Pills */
+.pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--border); background: #eef1f5; color: var(--muted);
+}
+.pill-active, .pill-succeeded, .pill-completed, .pill-dispatched, .pill-approved { color: var(--ok); border-color: var(--ok); background: #e8f4e8; }
+.pill-pending, .pill-pending-start, .pill-queued, .pill-in-progress, .pill-retry-scheduled { color: var(--warn); border-color: var(--warn); background: #fdf6df; }
+.pill-terminated, .pill-dead-lettered, .pill-failed, .pill-rejected, .pill-revoked, .pill-dispatchfailed { color: var(--danger); border-color: var(--danger); background: #fbeaea; }
+.pill-neutral { color: var(--muted); }
+
+/* Detail grid */
+.detail-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px 24px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 16px; margin: 0 0 8px;
+}
+.detail-grid dt { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.detail-grid dd { margin: 2px 0 0; }
+
+/* Cards */
+.card-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; }
+.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ent-list { margin: 8px 0; padding-left: 18px; }
+.ent-list li { margin: 3px 0; }
+
+/* Misc */
+.page-loading { padding: 32px; color: var(--muted); }
+.error-box {
+  background: #fbeaea; border: 1px solid var(--danger); color: var(--danger);
+  padding: 10px 14px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap;
+}
+.success-box {
+  background: #e8f4e8; border: 1px solid var(--ok); color: var(--ok);
+  padding: 10px 14px; border-radius: 6px; margin: 12px 0;
+}
+.empty { padding: 24px; color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: 6px; }
+.link-banner { max-width: 640px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; }
+.picker-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.picker-list li { display: flex; align-items: center; gap: 12px; padding: 6px 0; border-top: 1px solid var(--border); }
+.linked-as { color: var(--muted); margin: -8px 0 16px; }
+.cart-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.cart-row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; }
