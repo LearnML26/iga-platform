@@ -50,8 +50,10 @@ previously-seen keys.
 ## Demo sequence
 
 1. Regenerate fixtures (above); upload `round1_baseline.csv` (+ `.md5`
-   sidecar) to `raw/` and ingest. Expect: `recordsAdded: 50`, with J1046–
-   J1050 created as `pending-start` and everyone else `active`.
+   sidecar) to `raw/` and ingest. Expect: `recordsAdded: 50`, with the 5
+   future-dated joiners (`JOINER_KEYS` in the regenerated
+   `fixture_keys.env`) created as `pending-start` and everyone else
+   `active`.
 2. Trigger the sweep (`POST /lifecycle/sweep`, or wait for the CronJob).
    Expect: the three joiners inside the 3-day pre-start window flip to
    `active`; the +7/+14 ones **stay** `pending-start`.
