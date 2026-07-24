@@ -157,6 +157,10 @@ for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
     echo "==> waiting for ${SVC}-migrate Job"
     if kubectl wait --for=condition=complete "job/${SVC}-migrate" -n iga --timeout=180s; then
       kubectl rollout restart "deployment/${SVC}" -n iga
+      # Wait for the restart to actually finish rather than handing control
+      # back immediately — verify.sh run right after this script otherwise
+      # catches the new pods mid-startup and reports a false "not ready".
+      kubectl rollout status "deployment/${SVC}" -n iga --timeout=120s
     else
       echo "!! ${SVC}-migrate Job did not complete — check: kubectl logs -n iga job/${SVC}-migrate"
       echo "!! this is very likely the SQL permission grant below not having been run yet"
