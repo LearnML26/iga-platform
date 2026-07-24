@@ -837,13 +837,52 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   (enriched with request/line-item context + an `actionable` flag
   mirroring the decide endpoint's chain-ordering rule). Both covered by
   new verify.sh checks.
-  DOCUMENTED GAP, not hidden: no Entra-user→identity-record mapping
-  exists anywhere (identities carry no email/UPN attribute), so the
-  portal asks the user to search-and-link their own identity record once
-  (localStorage). The link is UI convenience only — authorization is
-  entirely the token's app roles, so a user could link any record; the
-  same class of unenforced-binding gap as 3.2's approver-identity note
-  and PlatformRole, resolvable once an identity↔UPN mapping lands.
+  GAP CLOSED (approver-binding hardening task, post-3.6): the identity
+  link is now server-side and ENFORCED for approval decisions.
+  identity-service gained `entraObjectId` — settable ONLY via
+  POST /identities/{id}/claim, which binds the CALLER's validated token
+  oid (never a request-body value) to an unclaimed record: first claim
+  wins, idempotent same-oid re-claim, 409 for a different principal, one
+  identity per principal (so GET /identities/by-entra-object-id/{oid},
+  same shape as 2.3's by-correlation-key, is unambiguous — and 409s
+  loudly if data integrity is ever violated rather than picking one).
+  The field is deliberately absent from IdentityIn, stripped at create,
+  and immutable in PATCH — with extra="allow" it would otherwise be
+  spoofable by any identities.write holder. Claims are audited
+  (IdentityClaimed history event, actor=oid) and published to the event
+  hub. Gated on identities.read, not .write: it's not an arbitrary
+  write, and every portal persona holds read. App-only (service) tokens
+  may claim too — their oid is the SP's object id, verify.sh exercises
+  the whole flow through one, and allowing it weakens nothing (app-only
+  requests.write holders could previously decide steps as ANYONE).
+  access-request-service's decide endpoint now resolves the caller's oid
+  via that lookup and returns 403 for an unlinked caller or a caller
+  whose claimed identity isn't the step's assigned approver;
+  decidedByIdentityId is server-resolved and was REMOVED from the
+  request schema (unknown keys are dropped, so old clients still work —
+  their self-declared identity is simply ignored). Mechanical note: the
+  task spec suggested `Depends(require_role(...))`, but require_role()
+  already returns a Depends — endpoints capture claims as
+  `claims: dict = require_role(...)`.
+  The portal now claims server-side (localStorage is a display cache
+  only) and auto-resolves an existing claim from the MSAL account's oid
+  on load, so the binding follows the user across browsers.
+  verify.sh: unlinked-caller 403 (fresh environments only — claims are
+  permanent, so after the AR service principal's oid links once there is
+  no unlinked requests.write principal left; the check self-skips),
+  claim + server-resolved-decider assertion on the approve path, and an
+  every-run wrong-approver 403 against a step assigned to a fresh
+  never-claimed identity.
+  Residual gaps, still open and documented: (1) nothing verifies the
+  HUMAN behind a token corresponds to the HR record they claim
+  (identities carry no UPN/email to match) — first-claim-wins bounds the
+  damage; attribute-matched auto-claim is the v-next once feeds supply a
+  UPN. (2) OUT OF SCOPE here by explicit task decision: rbac-service's
+  PlatformRole binding (role-owner/certifier enforcement) has the
+  identical unresolved shape — admin actions authorized by app role
+  alone with no per-user binding. It needs this same
+  entraObjectId-resolution pattern now that the primitive exists; scoped
+  out of the approval-chain task, tracked as a known follow-up.
   "Requestable entitlements" (REQ-UI-031) is interpreted as entitlements
   defined on active rbac-service roles (the only entitlement catalogue
   the platform has) plus a free-form entry — flagged interpretation.

@@ -11,6 +11,7 @@ export interface Identity {
   managerIdentityId?: string | null;
   startDate?: string | null;
   terminationDate?: string | null;
+  entraObjectId?: string | null;
   createdDate?: string;
   lastModifiedDate?: string;
   [k: string]: unknown;
