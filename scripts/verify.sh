@@ -544,6 +544,66 @@ else
   fi
 fi
 
+# rules-engine-service (4.1): health, 401, rule CRUD with actionType
+# validation, and the real event path end-to-end — a rule triggered by
+# IdentityAttributeChanged fires when this run's own identity is PATCHed,
+# proving publish → Event Hub → consumer → evaluation → execution log.
+# The rule's reconcile-all action is effectively a no-op here (every verify
+# run deletes its role at the end, so no active role has enabled membership
+# rules by this point) — deliberate: proves the pipeline without side
+# effects. Rule is deleted at the end; its few non-match log rows from
+# concurrent events are harmless accumulation.
+OUT=$(run_curl vrfy-rules-health http://rules-engine-service/healthz)
+echo "$OUT" | grep -q 'HTTP_STATUS:200' && ok "rules-engine-service /healthz 200" || bad "rules-engine health failed: $OUT"
+
+RULES_TOKEN=$(mint_token rules-engine-service)
+if [ -z "$RULES_TOKEN" ]; then
+  bad "could not mint a rules-engine token — is the rules.read/write app role assignment done? (roadmap/PHASES.md 4.1)"
+else
+  RULES_HDR=(-H "Authorization: Bearer $RULES_TOKEN")
+  RULES_NAME="vrfy-rule-$(date +%s)"
+
+  OUT=$(run_curl vrfy-rules-noauth -X POST http://rules-engine-service/rules \
+    -H 'Content-Type: application/json' -d "{\"name\":\"$RULES_NAME\",\"actionType\":\"rbac-reconcile\"}")
+  echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "rule create without token 401" || bad "expected 401 without token: $OUT"
+
+  OUT=$(run_curl vrfy-rules-badaction -X POST http://rules-engine-service/rules "${RULES_HDR[@]}" \
+    -H 'Content-Type: application/json' -d "{\"name\":\"$RULES_NAME-bad\",\"actionType\":\"launch-missiles\"}")
+  echo "$OUT" | grep -q 'HTTP_STATUS:422' && ok "unknown actionType rejected 422" || bad "expected 422 for unknown actionType: $OUT"
+
+  OUT=$(run_curl vrfy-rules-create -X POST http://rules-engine-service/rules "${RULES_HDR[@]}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$RULES_NAME\",\"triggerEventTypes\":[\"IdentityAttributeChanged\"],\"changedFieldsFilter\":[\"jobTitle\"],\"actionType\":\"rbac-reconcile\"}")
+  RULE_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  echo "$OUT" | grep -q 'HTTP_STATUS:201' && [ -n "${RULE_ID:-}" ] \
+    && ok "rule create 201 ($RULES_NAME)" || bad "rule create failed: $OUT"
+
+  if [ -n "${RULE_ID:-}" ]; then
+    # Manual run through the same logged path (also 4.2's future dry-run hook)
+    OUT=$(run_curl vrfy-rules-run -X POST "http://rules-engine-service/rules/${RULE_ID}/run" "${RULES_HDR[@]}")
+    echo "$OUT" | grep -q '"executed":true' && echo "$OUT" | grep -q 'rbac-reconcile' \
+      && ok "manual rule run executed and logged" || bad "manual rule run failed: $OUT"
+
+    # Event path: PATCH this run's identity's jobTitle → IdentityAttributeChanged
+    # → consumer fires the rule. Poll the execution log for the matched row.
+    run_curl vrfy-rules-patch -X PATCH "http://identity-service/identities/${VRFY_IDENTITY_ID}" \
+      "${AUTH_HDR[@]}" -H 'Content-Type: application/json' \
+      -d "{\"jobTitle\":\"Probe L$(date +%s)\"}" > /dev/null
+    RULES_EVENT_OK=0
+    for _ in 1 2 3 4 5 6 7 8; do
+      OUT=$(run_curl vrfy-rules-log "${RULES_HDR[@]}" \
+        "http://rules-engine-service/rule-executions?ruleId=${RULE_ID}&identityId=${VRFY_IDENTITY_ID}&matched=true&triggerSource=event")
+      if echo "$OUT" | grep -q '"matched":true'; then RULES_EVENT_OK=1; break; fi
+      sleep 5
+    done
+    [ "$RULES_EVENT_OK" = "1" ] \
+      && ok "attribute-change event fired the rule end-to-end (REQ-COR-RULES-001/002/007)" \
+      || bad "no matched execution log for the attribute-change event: $OUT"
+
+    run_curl vrfy-rules-del -X DELETE "http://rules-engine-service/rules/${RULE_ID}" "${RULES_HDR[@]}" > /dev/null
+  fi
+fi
+
 # The rbac-service and access-request-service dispatches just above queue
 # real connectorType:"ad" tasks that cannot succeed — there's no real
 # AD/LDAPS server for this dev cluster to bind to (confirmed, not just "not

@@ -155,7 +155,9 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
   }
 }
 
-resource zones 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = [for z in ['raw', 'curated']: {
+// 'eventhub-checkpoints' (Phase 4.1): partition-ownership/checkpoint state
+// for rules-engine-service's Event Hub consumer (BlobCheckpointStore).
+resource zones 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = [for z in ['raw', 'curated', 'eventhub-checkpoints']: {
   parent: blobService
   name: z
   properties: {
