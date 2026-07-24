@@ -521,7 +521,7 @@ async def list_assignments(
 @app.get("/assignments", dependencies=[require_role("rbac.read")])
 async def list_assignments_by_identity(
     identityId: str,
-    status: Optional[str] = "active",
+    status: str | None = "active",
     limit: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ):

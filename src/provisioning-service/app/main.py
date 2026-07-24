@@ -32,26 +32,25 @@ Architecture:
   selectively deleted either, so cancel marks the record and the worker
   completes the message WITHOUT executing when it sees status=cancelled.
 """
-import os
-import json
-import uuid
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+import os
+import uuid
+from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Optional
 
+from azure.identity.aio import DefaultAzureCredential
+from azure.servicebus import NEXT_AVAILABLE_SESSION, ServiceBusMessage
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus.exceptions import OperationTimeoutError
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from azure.identity.aio import DefaultAzureCredential
-from azure.servicebus.aio import ServiceBusClient
-from azure.servicebus import ServiceBusMessage, NEXT_AVAILABLE_SESSION
-from azure.servicebus.exceptions import OperationTimeoutError
 
-from .connectors import CONNECTOR_REGISTRY, ConnectorError
 from .auth import require_role
+from .connectors import CONNECTOR_REGISTRY, ConnectorError
 from .db import SessionLocal, engine, get_session
 from .models import ProvisioningTaskRecord
 
@@ -83,7 +82,7 @@ class ProvisioningTask(BaseModel):
     instanceId: str
     connectorType: str  # 'ad' | 'entra' | ...
     operationType: OperationType
-    entitlementRef: Optional[str] = None
+    entitlementRef: str | None = None
     payload: dict = {}
     attemptCount: int = 0
 
@@ -180,11 +179,11 @@ def _record_out(r: ProvisioningTaskRecord) -> dict:
 
 @app.get("/tasks", dependencies=[require_role("provisioning.write")])
 async def list_tasks(
-    status: Optional[str] = None,
-    identityId: Optional[str] = None,
-    instanceId: Optional[str] = None,
-    sourceType: Optional[str] = None,
-    connectorType: Optional[str] = None,
+    status: str | None = None,
+    identityId: str | None = None,
+    instanceId: str | None = None,
+    sourceType: str | None = None,
+    connectorType: str | None = None,
     limit: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ):
@@ -356,7 +355,7 @@ async def handle_message(receiver, msg) -> None:
         else:
             # Re-schedule with backoff
             delay = BACKOFF_MINUTES[min(task.attemptCount - 1, len(BACKOFF_MINUTES) - 1)]
-            scheduled = datetime.now(timezone.utc) + timedelta(minutes=delay)
+            scheduled = datetime.now(UTC) + timedelta(minutes=delay)
             await _send_task_message(task, scheduled=scheduled)
             await receiver.complete_message(msg)
             await _set_status(task, "retry-scheduled", attempt=task.attemptCount,
@@ -375,5 +374,5 @@ async def notify_failure(task: ProvisioningTask, error: str) -> None:
             "instanceId": task.instanceId,
             "operationType": task.operationType.value,
             "error": error,
-            "occurredAt": datetime.now(timezone.utc).isoformat(),
+            "occurredAt": datetime.now(UTC).isoformat(),
         })))
