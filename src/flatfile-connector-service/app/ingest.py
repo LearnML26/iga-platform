@@ -94,8 +94,8 @@ import io
 import json
 import logging
 import os
-from datetime import date, datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, date, datetime
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -131,10 +131,10 @@ class IngestError(Exception):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
-def _parse_iso_date(value: Any) -> Optional[date]:
+def _parse_iso_date(value: Any) -> date | None:
     """Best-effort ISO date parse for mapped date attributes. Accepts a bare
     YYYY-MM-DD or a full ISO timestamp (takes the date part). Returns None
     for anything unparseable — callers treat that as "no date", never as an
@@ -148,7 +148,7 @@ def _parse_iso_date(value: Any) -> Optional[date]:
         return None
 
 
-async def _verify_checksum(container_client, blob_path: str, content: bytes) -> Optional[str]:
+async def _verify_checksum(container_client, blob_path: str, content: bytes) -> str | None:
     """Verify file integrity before processing. Returns a note on how it was
     verified, or None if no checksum reference was available to check
     against (noted as a limitation, not fatal). Raises IngestError on a
@@ -191,7 +191,7 @@ async def _verify_checksum(container_client, blob_path: str, content: bytes) -> 
 
 async def run_ingestion(instance_id: str, blob_path: str, triggered_by: str = "manual") -> dict[str, Any]:
     credential = DefaultAzureCredential()
-    feed_run_id: Optional[str] = None
+    feed_run_id: str | None = None
     try:
         if not API_AUDIENCE:
             raise IngestError("API_AUDIENCE not configured; cannot authenticate to identity-service/provisioning-service")
@@ -240,7 +240,7 @@ async def run_ingestion(instance_id: str, blob_path: str, triggered_by: str = "m
         await credential.close()
 
 
-async def _call(coro) -> tuple[Optional[httpx.Response], Optional[str]]:
+async def _call(coro) -> tuple[httpx.Response | None, str | None]:
     """Run a single identity-service/provisioning-service apply call.
     Returns (response, None) on a completed round-trip — caller checks
     status_code — or (None, reason) on a network-level failure (timeout,
@@ -272,7 +272,7 @@ async def _dispatch_disable_accounts(
     identity_id: str,
     key: str,
     targets: list[str],
-    failure_budget: Optional[int] = None,
+    failure_budget: int | None = None,
 ) -> dict[str, Any]:
     """POST one disable-account task per target connector — the single
     dispatch loop shared by the ingest termination pass, the
@@ -286,7 +286,7 @@ async def _dispatch_disable_accounts(
     succeeded: list[str] = []
     failed_targets: list[str] = []
     attempted_failures = 0
-    halt_reason: Optional[str] = None
+    halt_reason: str | None = None
     for ti, connector_type in enumerate(targets):
         resp, err = await _call(provisioning_http.post(
             "/tasks", json=_disable_account_task(source_ref, instance_id, identity_id, key, connector_type)
@@ -323,7 +323,7 @@ async def _retry_pending_dispatches(
     nothing is ever dropped silently."""
     attempted = succeeded = failed = 0
     halted = False
-    halt_reason: Optional[str] = None
+    halt_reason: str | None = None
     remaining: dict[str, list[str]] = {}
 
     keys = list(pending.keys())
@@ -381,7 +381,7 @@ async def _apply_added_updated(
     failed = failed_so_far
     applied_keys: set[str] = set()
     halted = False
-    halt_reason: Optional[str] = None
+    halt_reason: str | None = None
 
     for key, target in unique_rows.items():
         attempted += 1
@@ -460,7 +460,7 @@ async def _apply_terminations(
     terminated = succeeded = attempted = 0
     failed = failed_so_far
     halted = False
-    halt_reason: Optional[str] = None
+    halt_reason: str | None = None
     removed_keys: set[str] = set()
     failed_target_dispatches: dict[str, list[str]] = {}
 
@@ -731,7 +731,7 @@ async def _save_state(
 
 async def _write_quarantine(raw_container, path: str, rows: list[tuple[int, dict, str]]) -> None:
     buf = io.StringIO()
-    fieldnames = sorted({k for _, row, _ in rows for k in row.keys()}) + ["_sourceRowNumber", "_quarantineReason"]
+    fieldnames = sorted({k for _, row, _ in rows for k in row}) + ["_sourceRowNumber", "_quarantineReason"]
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
     for row_num, row, reason in rows:

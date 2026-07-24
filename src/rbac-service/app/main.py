@@ -50,8 +50,8 @@ deploy.sh.
 """
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from azure.identity.aio import DefaultAzureCredential
@@ -76,7 +76,7 @@ app = FastAPI(title="IGA RBAC Service", version="1.0.0")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ def _now() -> datetime:
 # ---------------------------------------------------------------------------
 class RoleIn(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     status: str = "active"
 
 
@@ -134,12 +134,12 @@ class RoleAssignmentOut(BaseModel):
     assignmentType: str
     status: str
     createdDate: datetime
-    revokedDate: Optional[datetime]
+    revokedDate: datetime | None
 
 
 class PlatformRoleIn(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     permissions: list[str] = Field(default_factory=list)
 
 
@@ -242,7 +242,7 @@ async def create_role(body: RoleIn, session: AsyncSession = Depends(get_session)
 
 @app.get("/roles", response_model=list[RoleOut], dependencies=[require_role("rbac.read")])
 async def list_roles(
-    status: Optional[str] = None,
+    status: str | None = None,
     limit: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ):
@@ -509,7 +509,7 @@ async def create_assignment(role_id: str, body: RoleAssignmentIn, session: Async
     dependencies=[require_role("rbac.read")],
 )
 async def list_assignments(
-    role_id: str, status: Optional[str] = None, session: AsyncSession = Depends(get_session)
+    role_id: str, status: str | None = None, session: AsyncSession = Depends(get_session)
 ):
     stmt = select(RoleAssignment).where(RoleAssignment.roleId == role_id)
     if status:

@@ -15,7 +15,7 @@ Auth to Azure SQL uses DefaultAzureCredential -> workload identity in AKS
 """
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -38,11 +38,11 @@ app = FastAPI(title="IGA Source System Service", version="1.0.0")
 class SourceSystemInstanceIn(BaseModel):
     name: str
     connectorType: str
-    description: Optional[str] = None
+    description: str | None = None
     status: str = "active"
     config: dict[str, Any] = Field(default_factory=dict)
     provisioningTargets: list[str] = Field(default_factory=list)
-    ownerIdentityId: Optional[str] = None
+    ownerIdentityId: str | None = None
 
 
 class SourceSystemInstanceOut(SourceSystemInstanceIn):
@@ -55,7 +55,7 @@ class SourceSystemInstanceOut(SourceSystemInstanceIn):
 class AttributeMappingIn(BaseModel):
     sourceAttribute: str
     targetAttribute: str
-    transform: Optional[str] = None
+    transform: str | None = None
     isKey: bool = False
 
 
@@ -78,14 +78,14 @@ class FeedRunOut(BaseModel):
     status: str
     triggeredBy: str
     startedAt: datetime
-    completedAt: Optional[datetime]
+    completedAt: datetime | None
     recordsProcessed: int
     recordsAdded: int
     recordsUpdated: int
     recordsTerminated: int
     recordsUnmatched: int
     recordsQuarantined: int
-    errorSummary: Optional[str]
+    errorSummary: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ async def create_source_system(body: SourceSystemInstanceIn, session: AsyncSessi
 
 @app.get("/source-systems", response_model=list[SourceSystemInstanceOut])
 async def list_source_systems(
-    status: Optional[str] = None,
+    status: str | None = None,
     limit: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ):

@@ -42,7 +42,8 @@ message is abandoned (left un-completed) so Service Bus redelivers it.
 import asyncio
 import json
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pydantic import BaseModel
 

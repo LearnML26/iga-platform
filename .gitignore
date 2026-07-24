@@ -12,3 +12,4 @@ node_modules/
 kubeconfig
 .ruff_cache/
 .claude/
+web/dist/

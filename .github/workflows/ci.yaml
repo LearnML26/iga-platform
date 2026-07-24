@@ -24,7 +24,11 @@ jobs:
 
       - name: Python lint + tests
         run: |
-          pip install ruff pytest
+          # Pinned: an unpinned ruff let lint strictness drift with upstream
+          # releases (0.16.0 expanded the default rule set and broke every
+          # in-flight PR with pre-existing findings). Bump deliberately, in
+          # its own commit, alongside any new fixes the bump requires.
+          pip install ruff==0.16.0 pytest
           ruff check src/
           # pytest src/  # enable as test suites land
 

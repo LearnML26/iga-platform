@@ -11,21 +11,21 @@ Implements: REQ-COR-ID-001..009 (subset for v1 scaffold)
 Auth to Azure uses DefaultAzureCredential → workload identity in AKS
 (REQ-INF-031/062). No connection strings or keys anywhere.
 """
-import os
-import uuid
 import json
 import logging
-from datetime import datetime, timezone
+import os
+import uuid
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Optional, Any
+from typing import Any
 
+from azure.cosmos import exceptions as cosmos_exceptions
+from azure.cosmos.aio import CosmosClient
+from azure.eventhub import EventData
+from azure.eventhub.aio import EventHubProducerClient
+from azure.identity.aio import DefaultAzureCredential
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from azure.identity.aio import DefaultAzureCredential
-from azure.cosmos.aio import CosmosClient
-from azure.cosmos import exceptions as cosmos_exceptions
-from azure.eventhub.aio import EventHubProducerClient
-from azure.eventhub import EventData
 
 from .auth import require_role
 
@@ -71,17 +71,17 @@ class IdentityIn(BaseModel):
     correlationKey: str
     identityType: IdentityType = IdentityType.employee
     displayName: str
-    givenName: Optional[str] = None
-    familyName: Optional[str] = None
+    givenName: str | None = None
+    familyName: str | None = None
     status: IdentityStatus = IdentityStatus.active
-    sourceSystemId: Optional[str] = None
-    managerIdentityId: Optional[str] = None
-    department: Optional[str] = None
-    jobTitle: Optional[str] = None
-    location: Optional[str] = None
-    costCenter: Optional[str] = None
-    startDate: Optional[str] = None
-    terminationDate: Optional[str] = None
+    sourceSystemId: str | None = None
+    managerIdentityId: str | None = None
+    department: str | None = None
+    jobTitle: str | None = None
+    location: str | None = None
+    costCenter: str | None = None
+    startDate: str | None = None
+    terminationDate: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -132,7 +132,7 @@ async def publish_event(event_type: str, identity: dict) -> None:
     payload = {
         "eventId": str(uuid.uuid4()),
         "eventType": event_type,
-        "occurredAt": datetime.now(timezone.utc).isoformat(),
+        "occurredAt": datetime.now(UTC).isoformat(),
         "identityId": identity["identityId"],
         "tenantId": identity["tenantId"],
         "snapshot": identity,
@@ -150,7 +150,7 @@ async def write_history(identity_id: str, event_type: str, before: dict | None, 
         "identityId": identity_id,
         "eventType": event_type,
         "actor": actor,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "before": before,
         "after": after,
     })
@@ -187,7 +187,7 @@ async def create_identity(body: IdentityIn):
     if existing:
         raise HTTPException(status_code=409, detail=f"correlationKey '{body.correlationKey}' already correlated")
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     identity_id = str(uuid.uuid4())
     doc = {
         **body.model_dump(),
@@ -246,7 +246,7 @@ async def update_identity(identity_id: str, patch: dict):
         return before
 
     after = {**before, **changed_fields,
-             "lastModifiedDate": datetime.now(timezone.utc).isoformat()}
+             "lastModifiedDate": datetime.now(UTC).isoformat()}
     await app.state.identities.replace_item(item=identity_id, body=after)
     await write_history(identity_id, "IdentityUpdated", before, after, actor="api")
 
@@ -261,11 +261,11 @@ async def update_identity(identity_id: str, patch: dict):
 
 @app.get("/identities", dependencies=[require_role("identities.read")])
 async def search_identities(
-    department: Optional[str] = None,
-    status: Optional[IdentityStatus] = None,
-    manager: Optional[str] = Query(None, alias="managerIdentityId"),
-    q: Optional[str] = Query(None, description="displayName contains"),
-    terminationDateBefore: Optional[str] = Query(
+    department: str | None = None,
+    status: IdentityStatus | None = None,
+    manager: str | None = Query(None, alias="managerIdentityId"),
+    q: str | None = Query(None, description="displayName contains"),
+    terminationDateBefore: str | None = Query(
         None,
         description="ISO date (YYYY-MM-DD); matches identities whose "
         "terminationDate is set and <= this value. Dates are compared as "

@@ -70,13 +70,12 @@ spec fact — same discipline as 3.1.
 import json
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import httpx
 from azure.identity.aio import DefaultAzureCredential
-from azure.servicebus.aio import ServiceBusClient
 from azure.servicebus import ServiceBusMessage
+from azure.servicebus.aio import ServiceBusClient
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -100,7 +99,7 @@ app = FastAPI(title="IGA Access Request Service", version="1.0.0")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +109,7 @@ class LineItemIn(BaseModel):
     targetSystemInstanceId: str
     connectorType: str
     entitlementRef: str
-    justification: Optional[str] = None
+    justification: str | None = None
 
 
 class ApprovalStepOut(BaseModel):
@@ -119,12 +118,12 @@ class ApprovalStepOut(BaseModel):
     lineItemId: str
     sequenceOrder: int
     stepType: str
-    approverIdentityId: Optional[str]
+    approverIdentityId: str | None
     status: str
-    decidedByIdentityId: Optional[str]
-    comment: Optional[str]
+    decidedByIdentityId: str | None
+    comment: str | None
     createdDate: datetime
-    decidedDate: Optional[datetime]
+    decidedDate: datetime | None
 
 
 class LineItemOut(BaseModel):
@@ -134,7 +133,7 @@ class LineItemOut(BaseModel):
     targetSystemInstanceId: str
     connectorType: str
     entitlementRef: str
-    justification: Optional[str]
+    justification: str | None
     status: str
     createdDate: datetime
     lastModifiedDate: datetime
@@ -159,7 +158,7 @@ class RequestOut(BaseModel):
 class DecisionIn(BaseModel):
     decision: str  # approve | reject
     decidedByIdentityId: str
-    comment: Optional[str] = None
+    comment: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -234,14 +233,14 @@ async def _notify(event: dict) -> None:
         log.exception("failed to publish %s notification", event.get("type"))
 
 
-async def _resolve_manager(identity_http: httpx.AsyncClient, requester_id: str) -> Optional[str]:
+async def _resolve_manager(identity_http: httpx.AsyncClient, requester_id: str) -> str | None:
     resp = await identity_http.get(f"/identities/{requester_id}")
     if resp.status_code != 200:
         return None
     return resp.json().get("managerIdentityId")
 
 
-async def _resolve_owner(source_http: httpx.AsyncClient, target_system_instance_id: str) -> Optional[str]:
+async def _resolve_owner(source_http: httpx.AsyncClient, target_system_instance_id: str) -> str | None:
     resp = await source_http.get(f"/source-systems/{target_system_instance_id}")
     if resp.status_code != 200:
         return None
@@ -361,8 +360,8 @@ async def create_request(body: RequestIn, session: AsyncSession = Depends(get_se
 
 @app.get("/requests", response_model=list[RequestOut], dependencies=[require_role("requests.read")])
 async def list_requests(
-    requesterIdentityId: Optional[str] = None,
-    status: Optional[str] = None,
+    requesterIdentityId: str | None = None,
+    status: str | None = None,
     limit: int = Query(50, le=200),
     session: AsyncSession = Depends(get_session),
 ):
