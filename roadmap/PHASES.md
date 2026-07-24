@@ -665,11 +665,23 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   Request/LineItem/ApprovalStep models; default chain manager → owner
   (manager resolved from identity-service); notifications via
   notification queue; approval → provisioning task.
-  DONE, scaffold — same "no spec document, decisions flagged as
-  interpretation not fact" discipline as 3.1 (IGA_Platform_Requirements_
-  Specification.docx still isn't in the repo). Not yet live-verified: no
-  cluster access from this session, and a new [HUMAN] gate (below) blocks
-  a clean deploy the same way 3.1's did.
+  DONE, live-verified in the dev cluster. Same "no spec document,
+  decisions flagged as interpretation not fact" discipline as 3.1
+  (IGA_Platform_Requirements_Specification.docx still isn't in the repo).
+  Deploy hit the anticipated SQL-grant-not-yet-run bootstrapping order
+  (same class as every prior new service) — 4 failed migrate pods until
+  the sqldb-accessrequest grant landed. Also surfaced two real, unrelated
+  fixes: `kubectl run --rm -it` conflicts with piping a heredoc script as
+  stdin (needs plain `-i`, no `-t`) and Python buffers stdout fully when
+  it isn't a TTY, silently swallowing DeviceCodeCredential's login prompt
+  until `python3 -u` forced it to flush — both were tooling issues on the
+  human side, not this service. Also generalized a related deploy.sh gap
+  while here: `kubectl rollout restart` returns immediately, so `deploy.sh`
+  was handing control back before the restarted pods were actually ready,
+  and a verify.sh run immediately after caught them mid-startup and
+  reported a false "not ready" cluster-health failure despite every
+  functional check passing — added `kubectl rollout status` so `deploy.sh`
+  now waits for the rollout to finish before returning.
   Data model (sqldb-accessrequest, identical SQLAlchemy async + aioodbc +
   Entra token auth pattern as source-system-service/rbac-service):
   `Request` (self-service only in v1 — no on-behalf-of/delegated
