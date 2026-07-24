@@ -467,10 +467,29 @@ else
     -H 'Content-Type: application/json' -d '{"requesterIdentityId":"x","lineItems":[]}')
   echo "$OUT" | grep -q 'HTTP_STATUS:401' && ok "request create without token 401" || bad "expected 401 without token: $OUT"
 
-  OUT=$(run_curl vrfy-ar-mgr -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"correlationKey\":\"ARMGR${AR_TS}\",\"displayName\":\"Verify Manager\"}")
-  MGR_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  # Approver binding: decisions are only accepted from the principal that
+  # CLAIMED the step's approver identity. The "user" here is the AR
+  # service's own workload identity (its token oid) — claims are permanent
+  # and one-per-principal, so on the first run this claims a fresh manager
+  # identity (after proving the unlinked-403 path); every later run reuses
+  # the identity that oid already claimed as the manager.
+  AR_OID=$(echo "$AR_TOKEN" | cut -d. -f2 | python3 -c "
+import base64, json, sys
+p = sys.stdin.read().strip()
+print(json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)))['oid'])")
+  OUT=$(run_curl vrfy-ar-oidlookup "${AUTH_HDR[@]}" \
+    "http://identity-service/identities/by-entra-object-id/${AR_OID}")
+  if echo "$OUT" | grep -q 'HTTP_STATUS:200'; then
+    MGR_ID=$(echo "$OUT" | grep -o '"identityId":"[^"]*"' | head -1 | cut -d'"' -f4)
+    CLAIM_NEEDED=0
+    ok "caller oid already linked to identity $MGR_ID (claims are permanent — reusing as manager)"
+  else
+    OUT=$(run_curl vrfy-ar-mgr -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"correlationKey\":\"ARMGR${AR_TS}\",\"displayName\":\"Verify Manager\"}")
+    MGR_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    CLAIM_NEEDED=1
+  fi
 
   OUT=$(run_curl vrfy-ar-req-identity -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
     -H 'Content-Type: application/json' \
@@ -498,8 +517,9 @@ else
     STEP_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '3p' | cut -d'"' -f4)
 
     # 3.6 my-approvals queue: the pending manager step must appear in the
-    # approver-side view before it's decided (fresh MGR_ID each run, so the
-    # queue holds exactly this step).
+    # approver-side view before it's decided. (MGR_ID is the caller-claimed
+    # identity on repeat runs; earlier runs' steps for it were all decided,
+    # so this run's step is the pending one.)
     OUT=$(run_curl vrfy-ar-queue "${AR_HDR[@]}" \
       "http://access-request-service/approval-steps?approverIdentityId=${MGR_ID}&status=pending")
     echo "$OUT" | grep -q "\"${STEP_ID:-missing}\"" && echo "$OUT" | grep -q '"actionable":true' \
@@ -507,11 +527,34 @@ else
       || bad "approver queue unexpected: $OUT"
 
     if [ -n "${REQ_ID:-}" ] && [ -n "${LI_ID:-}" ] && [ -n "${STEP_ID:-}" ]; then
+      if [ "${CLAIM_NEEDED:-0}" = "1" ]; then
+        # Unlinked caller must be rejected BEFORE any claim exists. Only
+        # testable on a fresh environment: claims are permanent, so once
+        # this oid links (below) there is no unlinked requests.write
+        # principal left to test with.
+        OUT=$(run_curl vrfy-ar-unlinked -X POST \
+          "http://access-request-service/requests/${REQ_ID}/line-items/${LI_ID}/approval-steps/${STEP_ID}/decide" \
+          "${AR_HDR[@]}" -H 'Content-Type: application/json' -d '{"decision":"approve"}')
+        echo "$OUT" | grep -q 'HTTP_STATUS:403' && echo "$OUT" | grep -q 'not linked' \
+          && ok "unlinked caller rejected 403 (approver binding)" \
+          || bad "expected 403 for unlinked caller: $OUT"
+
+        OUT=$(run_curl vrfy-ar-claim -X POST \
+          "http://identity-service/identities/${MGR_ID}/claim" "${AR_HDR[@]}")
+        echo "$OUT" | grep -q "\"entraObjectId\":\"${AR_OID}\"" \
+          && ok "identity claimed (oid bound server-side, first claim wins)" \
+          || bad "claim failed: $OUT"
+      fi
+
+      # No decidedByIdentityId in the body: the server resolves the decider
+      # from the token oid — client-supplied identity is never trusted.
       OUT=$(run_curl vrfy-ar-decide -X POST \
         "http://access-request-service/requests/${REQ_ID}/line-items/${LI_ID}/approval-steps/${STEP_ID}/decide" \
         "${AR_HDR[@]}" -H 'Content-Type: application/json' \
-        -d "{\"decision\":\"approve\",\"decidedByIdentityId\":\"$MGR_ID\"}")
-      echo "$OUT" | grep -q '"status":"approved"' && ok "manager step approved" || bad "step decision failed: $OUT"
+        -d '{"decision":"approve"}')
+      echo "$OUT" | grep -q '"status":"approved"' && echo "$OUT" | grep -q "\"decidedByIdentityId\":\"${MGR_ID}\"" \
+        && ok "manager step approved; decider server-resolved to the claimed identity" \
+        || bad "step decision failed: $OUT"
 
       OUT=$(run_curl vrfy-ar-get "${AR_HDR[@]}" "http://access-request-service/requests/${REQ_ID}")
       echo "$OUT" | grep -q '"status":"dispatched"' && ok "line item dispatched on final approval (REQ-COR-REQ-009)" \
@@ -520,6 +563,39 @@ else
         || bad "request did not complete: $OUT"
     else
       bad "access-request-service: could not capture request/line-item/step ids — skipped decision check"
+    fi
+
+    # Negative approver-binding test: a step assigned to a DIFFERENT (fresh,
+    # never-claimed) approver must reject this caller with 403, every run.
+    # The rejected request stays pending forever — same accepted accumulation
+    # class as correlationKey records (no delete endpoint).
+    OUT=$(run_curl vrfy-ar-mgr2 -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"correlationKey\":\"ARMGR2X${AR_TS}\",\"displayName\":\"Verify Other Manager\"}")
+    MGR2_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    OUT=$(run_curl vrfy-ar-req2 -X POST http://identity-service/identities "${AUTH_HDR[@]}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"correlationKey\":\"ARREQ2X${AR_TS}\",\"displayName\":\"Verify Requester Two\",\"managerIdentityId\":\"$MGR2_ID\"}")
+    REQ2_IDENTITY=$(echo "$OUT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "${MGR2_ID:-}" ] && [ -n "${REQ2_IDENTITY:-}" ]; then
+      OUT=$(run_curl vrfy-ar-create2 -X POST http://access-request-service/requests "${AR_HDR[@]}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"requesterIdentityId\":\"$REQ2_IDENTITY\",\"lineItems\":[{\"targetSystemInstanceId\":\"$AR_SRC_ID\",\"connectorType\":\"ad\",\"entitlementRef\":\"CN=verify-request-group,DC=example,DC=com\"}]}")
+      REQ2_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '1p' | cut -d'"' -f4)
+      LI2_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '2p' | cut -d'"' -f4)
+      STEP2_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '3p' | cut -d'"' -f4)
+      if [ -n "${REQ2_ID:-}" ] && [ -n "${LI2_ID:-}" ] && [ -n "${STEP2_ID:-}" ]; then
+        OUT=$(run_curl vrfy-ar-wrongapprover -X POST \
+          "http://access-request-service/requests/${REQ2_ID}/line-items/${LI2_ID}/approval-steps/${STEP2_ID}/decide" \
+          "${AR_HDR[@]}" -H 'Content-Type: application/json' -d '{"decision":"approve"}')
+        echo "$OUT" | grep -q 'HTTP_STATUS:403' && echo "$OUT" | grep -q 'not the assigned approver' \
+          && ok "non-assigned approver rejected 403 (approver binding)" \
+          || bad "expected 403 for wrong approver: $OUT"
+      else
+        bad "approver-binding negative test: could not capture second request ids"
+      fi
+    else
+      bad "approver-binding negative test: identity setup failed"
     fi
   else
     bad "access-request-service: manager/requester/source-system setup failed — skipped request test"

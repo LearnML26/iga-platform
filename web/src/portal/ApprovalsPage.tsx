@@ -1,11 +1,9 @@
 /** Portal — my approvals queue (REQ-UI-032): steps awaiting the linked
  * identity's decision, from access-request-service's approver-side query.
- * NOTE (flagged in PHASES.md): decisions are authorised by the
- * requests.write app role only — the platform cannot yet verify the caller
- * IS the resolved approver (no per-user identity binding until the
- * Entra-user→identity mapping exists). The UI sends the linked identityId
- * as decidedByIdentityId for the audit trail.
- */
+ * Since the approver-binding task, decisions are server-enforced: the
+ * service resolves the caller's token oid to their claimed identity and
+ * rejects (403) anyone who isn't the step's assigned approver. The client
+ * sends no "who I am" — the server derives it from the token. */
 import { useState } from "react";
 import { api } from "../api/client";
 import { ApprovalStepView } from "../api/types";
@@ -30,7 +28,7 @@ export default function ApprovalsPage() {
     try {
       await api.post(
         `/api/requests/requests/${step.requestId}/line-items/${step.lineItemId}/approval-steps/${step.id}/decide`,
-        { decision, decidedByIdentityId: identityId },
+        { decision },
       );
       refresh();
     } catch (e) {

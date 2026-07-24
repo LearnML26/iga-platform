@@ -91,6 +91,13 @@ class Identity(IdentityIn):
     identityId: str
     createdDate: str
     lastModifiedDate: str
+    # Server-enforced Entra binding (approver-binding task, post-3.6): set
+    # ONLY via POST /identities/{id}/claim — deliberately absent from
+    # IdentityIn, stripped at create, and immutable in PATCH, because with
+    # extra="allow" it would otherwise be spoofable by any identities.write
+    # holder, defeating first-claim-wins. Cosmos needs no migration for a
+    # new optional field; documented here instead.
+    entraObjectId: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +204,9 @@ async def create_identity(body: IdentityIn):
         "createdDate": now,
         "lastModifiedDate": now,
     }
+    # extra="allow" would otherwise let a caller pre-set the Entra binding,
+    # bypassing /claim's first-claim-wins — server-owned field, stripped.
+    doc.pop("entraObjectId", None)
     await app.state.identities.create_item(doc)
     await write_history(identity_id, "IdentityCreated", None, doc, actor="api")
     await publish_event("IdentityCreated", doc)
@@ -225,6 +235,90 @@ async def get_identity_by_correlation_key(correlation_key: str):
     return existing[0]
 
 
+@app.get(
+    "/identities/by-entra-object-id/{oid}",
+    response_model=Identity,
+    dependencies=[require_role("identities.read")],
+)
+async def get_identity_by_entra_object_id(oid: str):
+    """Resolve an Entra principal (token `oid` claim) to its claimed identity
+    record — the server-side link consumed by access-request-service's
+    approver enforcement. Same shape as by-correlation-key above (2.3)."""
+    existing = [
+        item async for item in app.state.identities.query_items(
+            query="SELECT * FROM c WHERE c.entraObjectId = @o AND c.tenantId = @t",
+            parameters=[{"name": "@o", "value": oid},
+                        {"name": "@t", "value": TENANT_ID}],
+        )
+    ]
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"no identity claimed by Entra object id '{oid}'")
+    if len(existing) > 1:
+        # Shouldn't happen (claim enforces one identity per oid), but if it
+        # ever does, fail loudly rather than silently picking one — an
+        # ambiguous binding must not authorize anything.
+        raise HTTPException(status_code=409, detail=f"multiple identities claimed by '{oid}' — data integrity issue")
+    return existing[0]
+
+
+@app.post("/identities/{identity_id}/claim", response_model=Identity)
+async def claim_identity(identity_id: str, claims: dict = require_role("identities.read")):
+    """Bind the CALLER's Entra object id (`oid` claim, taken from the
+    validated token — never from the request body) to this identity record.
+    First claim wins: succeeds only while entraObjectId is null; re-claiming
+    with the same oid is an idempotent 200; a different oid gets 409. The
+    caller must also not already hold a claim on another identity (the
+    binding is 1:1 both ways — by-entra-object-id lookups must be
+    unambiguous).
+
+    Gated on identities.read, not identities.write: this is not an
+    arbitrary write — the server writes exactly one server-derived value
+    into a null field — and every portal persona holds identities.read.
+    App-only (service) tokens are accepted too: their oid is the service
+    principal's object id, verify.sh exercises the flow through one, and
+    allowing them weakens nothing (app-only requests.write holders could
+    previously decide steps as ANYONE, which this task removes).
+
+    Known residual gap, documented not hidden: any authenticated caller can
+    claim any UNCLAIMED identity — nothing verifies the human behind the
+    token corresponds to the HR record being claimed (identities carry no
+    UPN/email to match against). First-claim-wins bounds the damage;
+    attribute-matched auto-claim is the v-next once feeds supply a UPN."""
+    oid = claims.get("oid")
+    if not oid:
+        raise HTTPException(status_code=403, detail="token carries no oid claim")
+
+    already = [
+        item async for item in app.state.identities.query_items(
+            query="SELECT c.id FROM c WHERE c.entraObjectId = @o AND c.tenantId = @t",
+            parameters=[{"name": "@o", "value": oid},
+                        {"name": "@t", "value": TENANT_ID}],
+        )
+    ]
+    try:
+        before = await app.state.identities.read_item(item=identity_id, partition_key=TENANT_ID)
+    except cosmos_exceptions.CosmosResourceNotFoundError:
+        raise HTTPException(status_code=404, detail="identity not found")
+
+    if before.get("entraObjectId") == oid:
+        return before  # idempotent re-claim
+    if before.get("entraObjectId"):
+        raise HTTPException(status_code=409, detail="identity already claimed by a different principal")
+    if already:
+        raise HTTPException(
+            status_code=409,
+            detail=f"caller already claimed identity '{already[0]['id']}' — one identity per principal",
+        )
+
+    after = {**before, "entraObjectId": oid,
+             "lastModifiedDate": datetime.now(UTC).isoformat()}
+    await app.state.identities.replace_item(item=identity_id, body=after)
+    # Security-relevant binding: audited (REQ-COR-ID-004) with the oid as actor.
+    await write_history(identity_id, "IdentityClaimed", before, after, actor=oid)
+    await publish_event("IdentityClaimed", after)
+    return after
+
+
 @app.get("/identities/{identity_id}", response_model=Identity, dependencies=[require_role("identities.read")])
 async def get_identity(identity_id: str):
     try:
@@ -240,7 +334,8 @@ async def update_identity(identity_id: str, patch: dict):
     except cosmos_exceptions.CosmosResourceNotFoundError:
         raise HTTPException(status_code=404, detail="identity not found")
 
-    immutable = {"id", "identityId", "tenantId", "createdDate"}
+    # entraObjectId: server-owned via /claim only (see Identity model note).
+    immutable = {"id", "identityId", "tenantId", "createdDate", "entraObjectId"}
     changed_fields = {k: v for k, v in patch.items() if k not in immutable and before.get(k) != v}
     if not changed_fields:
         return before

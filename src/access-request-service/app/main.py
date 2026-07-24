@@ -157,7 +157,12 @@ class RequestOut(BaseModel):
 
 class DecisionIn(BaseModel):
     decision: str  # approve | reject
-    decidedByIdentityId: str
+    # decidedByIdentityId was removed (approver-binding task): the deciding
+    # identity is now SERVER-resolved from the caller's token oid via
+    # identity-service's claim binding — a client-supplied "who I am" was
+    # trusted blindly and is never accepted for anything security-relevant
+    # again. Clients still sending the field are ignored (Pydantic default
+    # drops unknown keys), so the change is wire-compatible.
     comment: str | None = None
 
 
@@ -464,17 +469,41 @@ async def list_approval_steps(
 # ---------------------------------------------------------------------------
 # Approval decisions (REQ-COR-REQ-006/007)
 # ---------------------------------------------------------------------------
+async def _resolve_caller_identity(claims: dict) -> str:
+    """Approver binding (closes the gap flagged since 3.2): map the caller's
+    token oid to their claimed identity record via identity-service's
+    by-entra-object-id lookup. 403 if the caller never claimed an identity.
+    Note: require_role() already returns a Depends-wrapped dependency, so
+    endpoints capture claims as `claims: dict = require_role(...)` — the
+    task spec's `Depends(require_role(...))` form would double-wrap."""
+    oid = claims.get("oid")
+    if not oid:
+        raise HTTPException(status_code=403, detail="token carries no oid claim")
+    async with await _identity_client() as identity_http:
+        resp = await identity_http.get(f"/identities/by-entra-object-id/{oid}")
+    if resp.status_code == 404:
+        raise HTTPException(status_code=403, detail="caller has not linked an identity")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"identity lookup failed: HTTP {resp.status_code}")
+    return resp.json()["identityId"]
+
+
 @app.post(
     "/requests/{request_id}/line-items/{line_item_id}/approval-steps/{step_id}/decide",
     response_model=ApprovalStepOut,
-    dependencies=[require_role("requests.write")],
 )
 async def decide_approval_step(
     request_id: str, line_item_id: str, step_id: str, body: DecisionIn,
     session: AsyncSession = Depends(get_session),
+    claims: dict = require_role("requests.write"),
 ):
     if body.decision not in ("approve", "reject"):
         raise HTTPException(status_code=422, detail="decision must be 'approve' or 'reject'")
+
+    # Enforce BEFORE loading state: an unlinked caller learns nothing about
+    # the step, and the resolved identity is compared against the step's
+    # assigned approver below.
+    caller_identity_id = await _resolve_caller_identity(claims)
 
     request = await session.get(Request, request_id)
     if request is None:
@@ -485,6 +514,8 @@ async def decide_approval_step(
     step = await session.get(ApprovalStep, step_id)
     if step is None or step.lineItemId != line_item_id:
         raise HTTPException(status_code=404, detail="approval step not found")
+    if step.approverIdentityId != caller_identity_id:
+        raise HTTPException(status_code=403, detail="not the assigned approver for this step")
     if step.status != "pending":
         raise HTTPException(status_code=409, detail=f"step is '{step.status}', not decidable")
 
@@ -495,7 +526,7 @@ async def decide_approval_step(
     if earlier_pending:
         raise HTTPException(status_code=409, detail="an earlier approval step is still pending")
 
-    step.decidedByIdentityId = body.decidedByIdentityId
+    step.decidedByIdentityId = caller_identity_id  # server-resolved, never client-supplied
     step.comment = body.comment
     step.decidedDate = _now()
 
