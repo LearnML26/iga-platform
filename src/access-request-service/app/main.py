@@ -415,6 +415,53 @@ async def cancel_request(request_id: str, session: AsyncSession = Depends(get_se
 
 
 # ---------------------------------------------------------------------------
+# Approver-side queue (Phase 3.6 — the portal's "my approvals", REQ-UI-032).
+# Flat query across all requests: which steps await THIS approver's decision.
+# Enriched with line-item/request context so the UI doesn't need N+1 calls.
+# ---------------------------------------------------------------------------
+@app.get("/approval-steps", dependencies=[require_role("requests.read")])
+async def list_approval_steps(
+    approverIdentityId: str,
+    status: str = "pending",
+    limit: int = Query(50, le=200),
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = (
+        select(ApprovalStep, LineItem, Request)
+        .join(LineItem, ApprovalStep.lineItemId == LineItem.id)
+        .join(Request, LineItem.requestId == Request.id)
+        .where(ApprovalStep.approverIdentityId == approverIdentityId)
+        .where(ApprovalStep.status == status)
+        .order_by(ApprovalStep.createdDate.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    out = []
+    for step, li, req in result.all():
+        # A step is only actionable once every earlier step in its chain is
+        # decided — mirror decide_approval_step's ordering rule so the UI
+        # can grey out not-yet-actionable rows instead of 409ing on click.
+        earlier = await session.execute(
+            select(ApprovalStep).where(
+                ApprovalStep.lineItemId == li.id,
+                ApprovalStep.sequenceOrder < step.sequenceOrder,
+                ApprovalStep.status == "pending",
+            )
+        )
+        out.append({
+            "id": step.id, "lineItemId": step.lineItemId, "sequenceOrder": step.sequenceOrder,
+            "stepType": step.stepType, "approverIdentityId": step.approverIdentityId,
+            "status": step.status, "createdDate": step.createdDate,
+            "actionable": earlier.scalars().first() is None,
+            "requestId": req.id, "requesterIdentityId": req.requesterIdentityId,
+            "targetSystemInstanceId": li.targetSystemInstanceId,
+            "connectorType": li.connectorType, "entitlementRef": li.entitlementRef,
+            "justification": li.justification,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Approval decisions (REQ-COR-REQ-006/007)
 # ---------------------------------------------------------------------------
 @app.post(

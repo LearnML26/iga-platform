@@ -6,6 +6,44 @@ metadata:
   annotations:
     azure.workload.identity/client-id: "${PROVISIONING_SVC_CLIENT_ID}"
 ---
+# One-shot Alembic migration for the Phase 3.5 task-state store
+# (sqldb-provisioning). Re-run safe: alembic upgrade head is a no-op once
+# the DB is at head. deploy.sh's SQL_MIGRATE_SERVICES loop handles the
+# delete-before-reapply + wait + rollout, same as the other SQL services.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: provisioning-service-migrate
+  namespace: iga
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: provisioning-service-migrate
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: provisioning-service
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ${ACR_LOGIN_SERVER}/provisioning-service:${IMAGE_TAG}
+          imagePullPolicy: Always
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - { name: SQL_SERVER,   value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE, value: "sqldb-provisioning" }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,6 +69,8 @@ spec:
             - { name: MAX_ATTEMPTS,         value: "5" }
             - { name: ENTRA_TENANT_ID,      value: "${ENTRA_TENANT_ID}" }
             - { name: API_AUDIENCE,         value: "${API_AUDIENCE}" }
+            - { name: SQL_SERVER,           value: "${SQL_SERVER_FQDN}" }
+            - { name: SQL_DATABASE,         value: "sqldb-provisioning" }
             - name: AD_SERVER
               valueFrom: { secretKeyRef: { name: ad-connector, key: server, optional: true } }
             - name: AD_BIND_DN

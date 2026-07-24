@@ -32,6 +32,13 @@ jobs:
           ruff check src/
           # pytest src/  # enable as test suites land
 
+      - name: Web build (Phase 3.4 — type-checks and bundles the SPA)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci && npm run build
+        working-directory: web
+
       - name: Container scan (REQ-INF-073)
         uses: aquasecurity/trivy-action@master
         with:

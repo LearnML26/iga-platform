@@ -130,6 +130,17 @@ module compute 'modules/compute.bicep' = {
   }
 }
 
+module web 'modules/web.bicep' = {
+  scope: rgCompute
+  name: 'web'
+  params: {
+    suffix: suffix
+    tags: tags
+    // NOT the deployment's primary location: SWA rejects eastus (module
+    // header explains); the module default (eastus2) is used deliberately.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Outputs consumed by deploy.sh and CI
 // ---------------------------------------------------------------------------
@@ -144,3 +155,5 @@ output serviceBusNamespace string = messaging.outputs.serviceBusNamespace
 output eventHubNamespace string = messaging.outputs.eventHubNamespace
 output computeResourceGroup string = rgCompute.name
 output dataResourceGroup string = rgData.name
+output staticWebAppName string = web.outputs.staticWebAppName
+output staticWebAppHostname string = web.outputs.defaultHostname

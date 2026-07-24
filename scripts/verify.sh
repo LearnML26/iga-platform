@@ -132,6 +132,45 @@ else
     -H 'Content-Type: application/json' \
     -d '{"sourceType":"manual","sourceRef":"verify","identityId":"verify","instanceId":"verify","connectorType":"ad","operationType":"grant"}')
   echo "$OUT" | grep -q 'HTTP_STATUS:202' && ok "task submit (authenticated) 202" || bad "authenticated task submit failed: $OUT"
+  PROV_TASK_ID=$(echo "$OUT" | grep -o '"taskId":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+  # 3.5 task-state store: the submit above must be visible as a record.
+  if [ -n "${PROV_TASK_ID:-}" ]; then
+    OUT=$(run_curl vrfy-prov-rec -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+      "http://provisioning-service/tasks/${PROV_TASK_ID}")
+    echo "$OUT" | grep -q 'HTTP_STATUS:200' && echo "$OUT" | grep -q '"status"' \
+      && ok "task record visible in the 3.5 task store" || bad "task record lookup failed: $OUT"
+  fi
+
+  # 3.5 cancel flow: a task with an unregistered connectorType fails its
+  # first attempt instantly (ConnectorError, no external side effects) and
+  # becomes retry-scheduled — deterministically cancellable. The pending
+  # 1-minute retry message is then completed WITHOUT executing when the
+  # worker sees the cancelled record, so this leaves nothing behind.
+  OUT=$(run_curl vrfy-prov-c1 -X POST http://provisioning-service/tasks \
+    -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"sourceType":"manual","sourceRef":"verify-cancel","identityId":"verify-cancel","instanceId":"verify","connectorType":"vrfy-none","operationType":"grant"}')
+  CANCEL_TASK_ID=$(echo "$OUT" | grep -o '"taskId":"[^"]*"' | head -1 | cut -d'"' -f4)
+  if [ -n "${CANCEL_TASK_ID:-}" ]; then
+    CANCEL_OK=0
+    for _ in 1 2 3 4 5 6; do
+      OUT=$(run_curl vrfy-prov-c2 -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+        "http://provisioning-service/tasks/${CANCEL_TASK_ID}")
+      if echo "$OUT" | grep -q '"status":"retry-scheduled"'; then CANCEL_OK=1; break; fi
+      sleep 5
+    done
+    if [ "$CANCEL_OK" = "1" ]; then
+      OUT=$(run_curl vrfy-prov-c3 -X POST -H "Authorization: Bearer $PROVISIONING_TOKEN" \
+        "http://provisioning-service/tasks/${CANCEL_TASK_ID}/cancel")
+      echo "$OUT" | grep -q '"status":"cancelled"' && ok "task cancel (queued→failed-attempt→retry-scheduled→cancelled)" \
+        || bad "task cancel failed: $OUT"
+    else
+      bad "cancel-probe task never reached retry-scheduled: $OUT"
+    fi
+  else
+    bad "cancel-probe task submit failed: $OUT"
+  fi
 fi
 
 # source-system-service: health, create, dedupe (unique name), mapping, feed run
@@ -392,6 +431,13 @@ else
     echo "$OUT" | grep -q '"assignmentType":"rule"' && [ -n "${ASSIGNMENT_ID:-}" ] \
       && ok "active rule-sourced assignment recorded" || bad "assignment list unexpected: $OUT"
 
+    # 3.6 my-access view: cross-role assignments for this run's identity
+    # (must run before the role delete below, which cascades assignments).
+    OUT=$(run_curl vrfy-rbac-myaccess "${RBAC_HDR[@]}" \
+      "http://rbac-service/assignments?identityId=${VRFY_IDENTITY_ID}")
+    echo "$OUT" | grep -q '"roleName"' && ok "assignments-by-identity returns enriched roleName (REQ-UI-030)" \
+      || bad "assignments-by-identity unexpected: $OUT"
+
     if [ -n "${ASSIGNMENT_ID:-}" ]; then
       OUT=$(run_curl vrfy-rbac-revoke -X DELETE \
         "http://rbac-service/roles/${ROLE_ID}/assignments/${ASSIGNMENT_ID}" "${RBAC_HDR[@]}")
@@ -450,6 +496,15 @@ else
     REQ_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '1p' | cut -d'"' -f4)
     LI_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '2p' | cut -d'"' -f4)
     STEP_ID=$(echo "$OUT" | grep -o '"id":"[^"]*"' | sed -n '3p' | cut -d'"' -f4)
+
+    # 3.6 my-approvals queue: the pending manager step must appear in the
+    # approver-side view before it's decided (fresh MGR_ID each run, so the
+    # queue holds exactly this step).
+    OUT=$(run_curl vrfy-ar-queue "${AR_HDR[@]}" \
+      "http://access-request-service/approval-steps?approverIdentityId=${MGR_ID}&status=pending")
+    echo "$OUT" | grep -q "\"${STEP_ID:-missing}\"" && echo "$OUT" | grep -q '"actionable":true' \
+      && ok "approver queue lists the pending step as actionable (REQ-UI-032)" \
+      || bad "approver queue unexpected: $OUT"
 
     if [ -n "${REQ_ID:-}" ] && [ -n "${LI_ID:-}" ] && [ -n "${STEP_ID:-}" ]; then
       OUT=$(run_curl vrfy-ar-decide -X POST \

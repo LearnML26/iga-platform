@@ -763,15 +763,92 @@ criteria. Tick the box and add a one-line note when done. Tasks marked
   [HUMAN gate] — service degrades to log-and-skip until the
   `notification-sender` Key Vault secrets/k8s Secret are populated (see
   scripts/deploy.sh next-steps output).
-- [ ] **3.4 React frontend scaffold** — REQ-UI-001..005, 010..017. Vite +
+- [x] **3.4 React frontend scaffold** — REQ-UI-001..005, 010..017. Vite +
   React + TypeScript in `web/`. MSAL.js auth-code+PKCE against Entra
   [HUMAN gate: SPA app registration]. Unified login page per REQ-UI-010/013,
   persona routing per REQ-UI-014. Serve via Static Web App (add Bicep).
-- [ ] **3.5 Admin console v1** — REQ-UI-020..025. Identities list/search/
+  DONE (scaffold + build verified locally; live sign-in pending the SPA
+  gate). No REQ-UI spec text exists in the repo (same gap as 3.1/3.2) —
+  the UI is an interpretation of the one-line summaries, flagged per item.
+  Stack: Vite 5 + React 18 + TS strict; deps deliberately minimal
+  (@azure/msal-browser/react + react-router only, hand-rolled CSS).
+  `npm run build` (tsc + vite) passes and runs in CI's validate job.
+  Auth design — zero backend changes: the SPA acquires a DELEGATED token
+  for iga-platform-api's new `access_as_user` scope; Entra puts the
+  user's assigned app roles in that token's `roles` claim, the exact
+  claim every service's require_role() already validates. The [HUMAN]
+  gate is scripts/spa-gate.sh (printed by deploy.sh): creates the
+  iga-platform-spa registration (PKCE public client, no secret exists
+  anywhere), registers api://<appId> + the scope + pre-authorizes the
+  SPA, flips the existing app roles' allowedMemberTypes to
+  Application+User (Graph requires the disable→modify→enable dance), and
+  assigns all roles to the signed-in user.
+  Persona routing (REQ-UI-014) is an interpretation: no persona store
+  exists anywhere, so persona = app roles held (identities.write ⇒ admin
+  console + portal; otherwise portal only). Client-side routing is
+  convenience — every call is enforced server-side.
+  CRITICAL, DELIBERATE SCOPE LIMIT: the services are ClusterIP-only in a
+  private VNet with no ingress — the roadmap's own plan for public API
+  exposure is 4.5's APIM, so the publicly-hosted SPA (Static Web App,
+  infra/modules/web.bicep, Free tier, eastus2 because SWA rejects eastus
+  — same documented-exception class as SQL in canadacentral) hosts
+  static assets that can sign in but cannot reach the APIs yet. The
+  fully-functional path today is scripts/dev-portal.sh: port-forwards
+  all five services and starts Vite with /api/* proxies — the browser
+  carries a real delegated token end-to-end against the real cluster,
+  zero mocks. SWA content deploy is human-run (deployment token is a
+  secret; spa-gate.sh prints the steps).
+- [x] **3.5 Admin console v1** — REQ-UI-020..025. Identities list/search/
   detail (history view), target system instances, provisioning task queue
   with retry/cancel, source system feed runs.
-- [ ] **3.6 End-user portal v1** — REQ-UI-030..032. My access, request cart
+  DONE (code complete; live verification pending deploy + gates).
+  Identities list/search (department/status/name-contains, the filters
+  identity-service already had), detail with the append-only history
+  diffed per-field client-side; target-system registry (source-system-
+  service's, dual-purposed per 2.3/3.1 precedent — that service still has
+  no auth wired, pre-existing gap); feed runs with full delta summaries.
+  The task queue REQUIRED A BACKEND ADDITION — provisioning-service had
+  only POST /tasks; tasks lived solely as Service Bus messages, nothing
+  queryable. Added the sqldb-provisioning task-state store (that DB was
+  in data.bicep's serviceDatabases from day one — clearly the intended
+  design, finally used): a record per task, status transitions written
+  by the worker (queued/in-progress/retry-scheduled/succeeded/
+  dead-lettered/cancelled), best-effort so a SQL blip can never poison
+  queue processing; worker backfills rows for pre-migration messages.
+  GET /tasks(+filters)/{id}, POST retry (re-enqueues from the record,
+  fresh attempt budget; the DLQ copy stays — no selective DLQ delete
+  exists, drain script remains the cleanup), POST cancel (marks the
+  record; worker completes the message unexecuted). All gated on
+  provisioning.write — a new provisioning.read role would mean another
+  Graph gate with no current read-only caller; deliberate coarse choice.
+  New [ONE-TIME, HUMAN] gate: sqldb-provisioning SQL grant (printed by
+  deploy.sh); provisioning-service's Dockerfile gained the msodbcsql18
+  block and a migrate Job (already covered by the SQL_MIGRATE_SERVICES
+  loop). verify.sh: record-visible check + a deterministic cancel test
+  (unregistered connectorType fails its first attempt instantly →
+  retry-scheduled → cancel; the pending retry message is then completed
+  unexecuted, so the probe self-cleans).
+- [x] **3.6 End-user portal v1** — REQ-UI-030..032. My access, request cart
   against requestable entitlements, my approvals queue.
+  DONE (code complete; live verification pending deploy + gates).
+  Two small backend additions: rbac-service GET /assignments?identityId=
+  (cross-role, enriched with role name + entitlements) and
+  access-request-service GET /approval-steps?approverIdentityId=
+  (enriched with request/line-item context + an `actionable` flag
+  mirroring the decide endpoint's chain-ordering rule). Both covered by
+  new verify.sh checks.
+  DOCUMENTED GAP, not hidden: no Entra-user→identity-record mapping
+  exists anywhere (identities carry no email/UPN attribute), so the
+  portal asks the user to search-and-link their own identity record once
+  (localStorage). The link is UI convenience only — authorization is
+  entirely the token's app roles, so a user could link any record; the
+  same class of unenforced-binding gap as 3.2's approver-identity note
+  and PlatformRole, resolvable once an identity↔UPN mapping lands.
+  "Requestable entitlements" (REQ-UI-031) is interpreted as entitlements
+  defined on active rbac-service roles (the only entitlement catalogue
+  the platform has) plus a free-form entry — flagged interpretation.
+  Approvals queue drives the existing decide endpoint; RequestDecided/
+  ApprovalRequested notifications flow as wired in 3.2.
 
 ## Phase 4 — Assurance: certifications, rules, API engine (spec §5.5, §5.9, §5.6)
 

@@ -141,7 +141,7 @@ export API_AUDIENCE="api://$(az ad app list --display-name iga-platform-api --qu
 # recreated cleanly. (1R.7: this bit source-system-service once already;
 # rbac-service needs the identical treatment, hence the loop rather than
 # duplicating the block per service.)
-SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service)
+SQL_MIGRATE_SERVICES=(source-system-service rbac-service access-request-service provisioning-service)
 for SVC in "${SQL_MIGRATE_SERVICES[@]}"; do
   kubectl delete "job/${SVC}-migrate" -n iga --ignore-not-found
 done
@@ -173,6 +173,11 @@ echo "=== Deployment complete ==="
 kubectl get pods -n iga
 echo ""
 echo "Next steps:"
+echo "  - [HUMAN gate, Phase 3.4] Web frontend sign-in — run ./scripts/spa-gate.sh (directory perms needed)."
+echo "    It creates the iga-platform-spa registration, exposes the access_as_user delegated scope on"
+echo "    iga-platform-api, makes the existing app roles user-assignable, assigns them all to you, and"
+echo "    prints the three VITE_ values for web/.env.local. Then: ./scripts/dev-portal.sh for the local"
+echo "    dev loop (the cluster has no public ingress until 4.5's APIM — the SWA hosts static assets only)."
 echo "  - Store AD connector bind credentials in Key Vault kv-${SUFFIX} and sync to the 'ad-connector' k8s secret via CSI SecretProviderClass"
 echo "  - [HUMAN gate, Phase 3.3] Store notification-service sender config in Key Vault kv-${SUFFIX} and sync to the"
 echo "    'notification-sender' k8s secret (same manual/CSI pattern as ad-connector above). Until this is done the"
@@ -240,6 +245,13 @@ echo "      CREATE USER [mi-${SUFFIX}-access-request-service] FROM EXTERNAL PROV
 echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-access-request-service];"
 echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-access-request-service];"
 echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-access-request-service];  -- needed for Alembic's CREATE TABLE"
+echo "  - [ONE-TIME, HUMAN] Grant provisioning-service's managed identity access to sqldb-provisioning (Phase 3.5"
+echo "    task-state store — same pattern as the other SQL services above, run from inside the VNet as an"
+echo "    iga-platform-admins member):"
+echo "      CREATE USER [mi-${SUFFIX}-provisioning-service] FROM EXTERNAL PROVIDER;"
+echo "      ALTER ROLE db_datareader ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
+echo "      ALTER ROLE db_datawriter ADD MEMBER [mi-${SUFFIX}-provisioning-service];"
+echo "      ALTER ROLE db_ddladmin  ADD MEMBER [mi-${SUFFIX}-provisioning-service];  -- needed for Alembic's CREATE TABLE"
 echo "  - [HUMAN gate, Phase 3.2] access-request-service needs two NEW iga-platform-api app roles that don't exist"
 echo "    yet (requests.read, requests.write) — same Graph app-update pattern as 3.1's rbac.read/rbac.write. Run:"
 echo "      API_APP_ID=\$(az ad app list --display-name iga-platform-api --query '[0].id' -o tsv)"
